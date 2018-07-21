@@ -21,11 +21,17 @@
 #include "config.h"
 
 #include "bolt-bouncer.h"
+#include "bolt-config.h"
 #include "bolt-device.h"
+#include "bolt-domain.h"
 #include "bolt-error.h"
-#include "bolt-manager.h"
+#include "bolt-log.h"
+#include "bolt-power.h"
 #include "bolt-store.h"
 #include "bolt-str.h"
+#include "bolt-sysfs.h"
+
+#include "bolt-manager.h"
 
 #include <libudev.h>
 #include <string.h>
@@ -46,9 +52,17 @@ static void     bolt_manager_initable_iface_init (GInitableIface *iface);
 static gboolean bolt_manager_initialize (GInitable    *initable,
                                          GCancellable *cancellable,
                                          GError      **error);
+/* domain related functions */
+static BoltDomain *  manager_find_domain_by_syspath (BoltManager *mgr,
+                                                     const char  *syspath);
 
-/*  */
+static void          manager_register_domain (BoltManager *mgr,
+                                              BoltDomain  *domain);
 
+static void          manager_deregister_domain (BoltManager *mgr,
+                                                BoltDomain  *domain);
+
+/* device related functions */
 static void          manager_register_device (BoltManager *mgr,
                                               BoltDevice  *device);
 
@@ -68,6 +82,28 @@ static BoltDevice *  bolt_manager_get_parent (BoltManager *mgr,
 static GPtrArray *   bolt_manager_get_children (BoltManager *mgr,
                                                 BoltDevice  *target);
 
+static void          bolt_manager_label_device (BoltManager *mgr,
+                                                BoltDevice  *target);
+
+/* udev events */
+static gboolean      handle_uevent_udev (GIOChannel  *source,
+                                         GIOCondition condition,
+                                         gpointer     user_data);
+
+static void          handle_udev_domain_event (BoltManager        *mgr,
+                                               struct udev_device *device,
+                                               const char         *action);
+
+static void          handle_udev_domain_added (BoltManager        *mgr,
+                                               struct udev_device *udev);
+
+static void          handle_udev_domain_removed (BoltManager *mgr,
+                                                 BoltDomain  *domain);
+
+static void          handle_udev_device_event (BoltManager        *mgr,
+                                               struct udev_device *device,
+                                               const char         *action);
+
 static void          handle_udev_device_added (BoltManager        *mgr,
                                                struct udev_device *udev);
 
@@ -85,48 +121,75 @@ static void          handle_udev_device_attached (BoltManager        *mgr,
 static void          handle_udev_device_detached (BoltManager *mgr,
                                                   BoltDevice  *dev);
 
+/* signal callbacks */
 static void          handle_store_device_removed (BoltStore   *store,
                                                   const char  *uid,
                                                   BoltManager *mgr);
-/* acquiring indicator  */
+
 static void          handle_device_status_changed (BoltDevice  *dev,
                                                    BoltStatus   old,
                                                    BoltManager *mgr);
 
+/* acquiring indicator  */
 static void          manager_probing_device_added (BoltManager        *mgr,
                                                    struct udev_device *dev);
 
 static void          manager_probing_device_removed (BoltManager        *mgr,
                                                      struct udev_device *dev);
 
+static void          manager_probing_domain_added (BoltManager        *mgr,
+                                                   struct udev_device *domain);
+
 static void          manager_probing_activity (BoltManager *mgr,
                                                gboolean     weak);
 
-static void          manager_add_domain (BoltManager        *mgr,
-                                         struct udev_device *domain);
+/* force powering */
+static gboolean      manager_maybe_power_controller (BoltManager *mgr);
 
+/* config */
+static void          manager_load_user_config (BoltManager *mgr);
+
+/* dbus property setter */
+static gboolean handle_set_authmode (BoltExported *obj,
+                                     const char   *name,
+                                     const GValue *value,
+                                     GError      **error);
 
 /* dbus method calls */
-static gboolean handle_list_devices (BoltDBusManager       *object,
-                                     GDBusMethodInvocation *invocation,
-                                     gpointer               user_data);
+static GVariant *  handle_list_domains (BoltExported          *object,
+                                        GVariant              *params,
+                                        GDBusMethodInvocation *invocation,
+                                        GError               **error);
 
-static gboolean handle_device_by_uid (BoltDBusManager       *object,
-                                      GDBusMethodInvocation *invocation,
-                                      gpointer               user_data);
+static GVariant *  handle_domain_by_id (BoltExported          *object,
+                                        GVariant              *params,
+                                        GDBusMethodInvocation *invocation,
+                                        GError               **error);
 
-static gboolean handle_enroll_device (BoltDBusManager       *object,
-                                      GDBusMethodInvocation *invocation,
-                                      gpointer               user_data);
+static GVariant *  handle_list_devices (BoltExported          *object,
+                                        GVariant              *params,
+                                        GDBusMethodInvocation *invocation,
+                                        GError               **error);
 
-static gboolean handle_forget_device (BoltDBusManager       *object,
-                                      GDBusMethodInvocation *invocation,
-                                      gpointer               user_data);
+static GVariant *  handle_device_by_uid (BoltExported          *object,
+                                         GVariant              *params,
+                                         GDBusMethodInvocation *invocation,
+                                         GError               **error);
+
+static GVariant *  handle_enroll_device (BoltExported          *object,
+                                         GVariant              *params,
+                                         GDBusMethodInvocation *invocation,
+                                         GError               **error);
+
+static GVariant *  handle_forget_device (BoltExported          *object,
+                                         GVariant              *params,
+                                         GDBusMethodInvocation *invocation,
+                                         GError               **error);
 
 /*  */
 struct _BoltManager
 {
-  BoltDBusManagerSkeleton object;
+  BoltExported object;
 
   /* udev */
   struct udev         *udev;
@@ -134,11 +197,19 @@ struct _BoltManager
   GSource             *udev_source;
 
   /* state */
-  BoltStore *store;
-  GPtrArray *devices;
+  BoltStore   *store;
+  BoltDomain  *domains;
+  GPtrArray   *devices;
+  BoltPower   *power;
+  BoltSecurity security;
+  BoltAuthMode authmode;
 
   /* policy enforcer */
   BoltBouncer *bouncer;
+
+  /* config */
+  GKeyFile  *config;
+  BoltPolicy policy;          /* default enrollment policy, unless specified */
 
   /* probing indicator  */
   guint      authorizing;     /* number of devices currently authorizing */
@@ -153,13 +224,19 @@ enum {
 
   PROP_VERSION,
   PROP_PROBING,
+  PROP_POLICY,
+  PROP_SECURITY,
+  PROP_AUTHMODE,
 
-  PROP_LAST
+  PROP_LAST,
+  PROP_EXPORTED = PROP_VERSION
 };
+
+static GParamSpec *props[PROP_LAST] = {NULL, };
 
 G_DEFINE_TYPE_WITH_CODE (BoltManager,
                          bolt_manager,
-                         BOLT_DBUS_TYPE_MANAGER_SKELETON,
+                         BOLT_TYPE_EXPORTED,
                          G_IMPLEMENT_INTERFACE (G_TYPE_INITABLE,
                                                 bolt_manager_initable_iface_init));
 
@@ -193,6 +270,9 @@ bolt_manager_finalize (GObject *object)
 
   g_clear_object (&mgr->store);
   g_ptr_array_free (mgr->devices, TRUE);
+  bolt_domain_clear (&mgr->domains);
+
+  g_clear_object (&mgr->power);
 
   G_OBJECT_CLASS (bolt_manager_parent_class)->finalize (object);
 }
@@ -209,11 +289,23 @@ bolt_manager_get_property (GObject    *object,
   switch (prop_id)
     {
     case PROP_VERSION:
-      g_value_set_uint (value, VERSION_MINOR);
+      g_value_set_uint (value, BOLT_DBUS_API_VERSION);
       break;
 
     case PROP_PROBING:
       g_value_set_boolean (value, mgr->probing_timeout > 0);
+      break;
+
+    case PROP_POLICY:
+      g_value_set_enum (value, mgr->policy);
+      break;
+
+    case PROP_SECURITY:
+      g_value_set_enum (value, mgr->security);
+      break;
+
+    case PROP_AUTHMODE:
+      g_value_set_flags (value, mgr->authmode);
       break;
 
     default:
@@ -222,60 +314,107 @@ bolt_manager_get_property (GObject    *object,
 }
 
 static void
-bolt_manager_set_property (GObject      *object,
-                           guint         prop_id,
-                           const GValue *value,
-                           GParamSpec   *pspec)
-{
-  GParamSpec *parent;
-
-  /* This is one gross hack, see bolt_device_set_property() for details */
-  parent = g_object_class_find_property (bolt_manager_parent_class,
-                                         pspec->name);
-
-  if (parent == NULL)
-    return;
-
-  G_OBJECT_CLASS (bolt_manager_parent_class)->set_property (object,
-                                                            prop_id,
-                                                            value,
-                                                            parent);
-}
-
-
-static void
 bolt_manager_init (BoltManager *mgr)
 {
   mgr->devices = g_ptr_array_new_with_free_func (g_object_unref);
-  mgr->store = bolt_store_new (g_getenv ("BOLT_DBPATH") ?: BOLT_DBDIR);
+  mgr->store = bolt_store_new (g_getenv ("BOLT_DBPATH") ? : BOLT_DBDIR);
 
   mgr->probing_roots = g_ptr_array_new_with_free_func (g_free);
   mgr->probing_tsettle = PROBING_SETTLE_TIME_MS; /* milliseconds */
 
-  g_signal_connect (mgr, "handle-list-devices", G_CALLBACK (handle_list_devices), NULL);
-  g_signal_connect (mgr, "handle-device-by-uid", G_CALLBACK (handle_device_by_uid), NULL);
-  g_signal_connect (mgr, "handle-enroll-device", G_CALLBACK (handle_enroll_device), NULL);
-  g_signal_connect (mgr, "handle-forget-device", G_CALLBACK (handle_forget_device), NULL);
+  mgr->security = BOLT_SECURITY_UNKNOWN;
 
-  g_signal_connect (mgr->store, "device-removed", G_CALLBACK (handle_store_device_removed), mgr);
+  /* default configuration */
+  mgr->policy = BOLT_POLICY_AUTO;
+  mgr->authmode = BOLT_AUTH_ENABLED;
+
+  g_signal_connect_object (mgr->store, "device-removed",
+                           G_CALLBACK (handle_store_device_removed),
+                           mgr, 0);
 }
 
 static void
 bolt_manager_class_init (BoltManagerClass *klass)
 {
   GObjectClass *gobject_class = G_OBJECT_CLASS (klass);
+  BoltExportedClass *exported_class = BOLT_EXPORTED_CLASS (klass);
 
   gobject_class->finalize = bolt_manager_finalize;
   gobject_class->get_property = bolt_manager_get_property;
-  gobject_class->set_property = bolt_manager_set_property;
 
-  g_object_class_override_property (gobject_class,
-                                    PROP_VERSION,
-                                    "version");
+  props[PROP_VERSION] =
+    g_param_spec_uint ("version", "Version", "Version",
+                       0, G_MAXUINT32, 0,
+                       G_PARAM_READABLE |
+                       G_PARAM_STATIC_STRINGS);
 
-  g_object_class_override_property (gobject_class,
-                                    PROP_PROBING,
-                                    "probing");
+  props[PROP_PROBING] =
+    g_param_spec_boolean ("probing", "Probing", "Probing",
+                          FALSE,
+                          G_PARAM_READABLE |
+                          G_PARAM_STATIC_STRINGS);
+
+  props[PROP_POLICY] =
+    g_param_spec_enum ("default-policy", "DefaultPolicy", "DefaultPolicy",
+                       BOLT_TYPE_POLICY,
+                       BOLT_POLICY_AUTO,
+                       G_PARAM_READABLE |
+                       G_PARAM_STATIC_STRINGS);
+
+  props[PROP_SECURITY] =
+    g_param_spec_enum ("security-level", "SecurityLevel", NULL,
+                       BOLT_TYPE_SECURITY,
+                       BOLT_SECURITY_UNKNOWN,
+                       G_PARAM_READABLE |
+                       G_PARAM_STATIC_STRINGS);
+
+  props[PROP_AUTHMODE] =
+    g_param_spec_flags ("auth-mode", "AuthMode", NULL,
+                        BOLT_TYPE_AUTH_MODE,
+                        BOLT_AUTH_ENABLED,
+                        G_PARAM_READABLE |
+                        G_PARAM_STATIC_STRINGS);
+
+  g_object_class_install_properties (gobject_class, PROP_LAST, props);
+
+
+  bolt_exported_class_set_interface_info (exported_class,
+                                          BOLT_DBUS_INTERFACE,
+                                          "/boltd/org.freedesktop.bolt.xml");
+
+  bolt_exported_class_export_properties (exported_class,
+                                         PROP_EXPORTED,
+                                         PROP_LAST,
+                                         props);
+
+  bolt_exported_class_property_setter (exported_class,
+                                       props[PROP_AUTHMODE],
+                                       handle_set_authmode);
+
+  bolt_exported_class_export_method (exported_class,
+                                     "ListDomains",
+                                     handle_list_domains);
+
+  bolt_exported_class_export_method (exported_class,
+                                     "DomainById",
+                                     handle_domain_by_id);
+
+  bolt_exported_class_export_method (exported_class,
+                                     "ListDevices",
+                                     handle_list_devices);
+
+  bolt_exported_class_export_method (exported_class,
+                                     "DeviceByUid",
+                                     handle_device_by_uid);
+
+  bolt_exported_class_export_method (exported_class,
+                                     "EnrollDevice",
+                                     handle_enroll_device);
+
+  bolt_exported_class_export_method (exported_class,
+                                     "ForgetDevice",
+                                     handle_forget_device);
+
 }
 
 static void
@@ -375,98 +514,6 @@ setup_monitor (BoltManager        *mgr,
 }
 
 static gboolean
-handle_uevent_udev (GIOChannel  *source,
-                    GIOCondition condition,
-                    gpointer     user_data)
-{
-  g_autoptr(BoltDevice) dev = NULL;
-  g_autoptr(udev_device) device = NULL;
-  BoltManager *mgr;
-  const char *action;
-  const char *subsystem;
-  const char *devtype;
-
-  mgr = BOLT_MANAGER (user_data);
-  device = udev_monitor_receive_device (mgr->udev_monitor);
-
-  if (device == NULL)
-    return G_SOURCE_CONTINUE;
-
-  action = udev_device_get_action (device);
-  if (action == NULL)
-    return G_SOURCE_CONTINUE;
-
-  devtype = udev_device_get_devtype (device);
-  subsystem = udev_device_get_subsystem (device);
-
-  if (g_str_equal (action, "add"))
-    manager_probing_device_added (mgr, device);
-  else if (g_str_equal (action, "remove"))
-    manager_probing_device_removed (mgr, device);
-
-  /* beyond this point only thunderbolt/thunderbolt_device
-   * devices are allowed */
-  if (!bolt_streq (devtype, "thunderbolt_device") ||
-      !bolt_streq (subsystem, "thunderbolt"))
-    return G_SOURCE_CONTINUE;
-
-  g_debug ("uevent [ UDEV ]: %s (%s%s%s)", action,
-           subsystem, devtype ? "/" : "", devtype ? : "");
-
-  if (g_str_equal (action, "add") ||
-      g_str_equal (action, "change"))
-    {
-      const char *uid;
-
-      /* filter sysfs devices (e.g. the domain) that don't have
-       * the unique_id attribute */
-      uid = udev_device_get_sysattr_value (device, "unique_id");
-      if (uid == NULL)
-        return G_SOURCE_CONTINUE;
-
-      dev = manager_find_device_by_uid (mgr, uid, NULL);
-
-      if (!dev)
-        handle_udev_device_added (mgr, device);
-      else if (!bolt_device_is_connected (dev))
-        handle_udev_device_attached (mgr, dev, device);
-      else
-        handle_udev_device_changed (mgr, dev, device);
-    }
-  else if (g_str_equal (action, "remove"))
-    {
-      const char *syspath;
-      const char *name;
-
-      syspath = udev_device_get_syspath (device);
-      if (syspath == NULL)
-        {
-          g_warning ("udev device without syspath");
-          return G_SOURCE_CONTINUE;
-        }
-
-      /* filter out the domain controller */
-      name = udev_device_get_sysname (device);
-      if (name && g_str_has_prefix (name, "domain"))
-        return G_SOURCE_CONTINUE;
-
-      dev = manager_find_device_by_syspath (mgr, syspath);
-
-      /* if we don't have any records of the device,
-       *  then we don't care */
-      if (!dev)
-        return G_SOURCE_CONTINUE;
-
-      if (bolt_device_get_stored (dev))
-        handle_udev_device_detached (mgr, dev);
-      else
-        hanlde_udev_device_removed (mgr, dev);
-    }
-
-  return G_SOURCE_CONTINUE;
-}
-
-static gboolean
 bolt_manager_initialize (GInitable    *initable,
                          GCancellable *cancellable,
                          GError      **error)
@@ -475,9 +522,13 @@ bolt_manager_initialize (GInitable    *initable,
   BoltManager *mgr;
   struct udev_enumerate *enumerate;
   struct udev_list_entry *l, *devices;
+  gboolean forced_power;
   gboolean ok;
 
   mgr = BOLT_MANAGER (initable);
+
+  /* load dynamic user configuration */
+  manager_load_user_config (mgr);
 
   /* polkit setup */
   mgr->bouncer = bolt_bouncer_new (cancellable, error);
@@ -511,30 +562,36 @@ bolt_manager_initialize (GInitable    *initable,
       return FALSE;
     }
 
-  g_debug ("Loading devices from store");
+  bolt_info (LOG_TOPIC ("store"), "loading devices");
   for (guint i = 0; i < g_strv_length (ids); i++)
     {
       g_autoptr(GError) err = NULL;
       BoltDevice *dev = NULL;
       const char *uid = ids[i];
 
+      bolt_info (LOG_DEV_UID (uid), LOG_TOPIC ("store"), "loading device");
+
       dev = bolt_store_get_device (mgr->store, uid, &err);
       if (dev == NULL)
         {
-          g_warning ("[%s] failed to load from store: %s",
-                     uid, err->message);
+          bolt_warn_err (err, LOG_TOPIC ("store"),
+                         LOG_DIRECT (BOLT_LOG_DEVICE_UID, uid),
+                         "failed to load device (%.7s)", uid);
           continue;
         }
 
       manager_register_device (mgr, dev);
     }
 
+  mgr->power = bolt_power_new (mgr->udev);
+  forced_power = manager_maybe_power_controller (mgr);
+
   /* TODO: error checking */
   enumerate = udev_enumerate_new (mgr->udev);
   udev_enumerate_add_match_subsystem (enumerate, "thunderbolt");
   /* only devices (i.e. not the domain controller) */
 
-  g_debug ("Enumerating devices from udev");
+  bolt_info (LOG_TOPIC ("udev"), "enumerating devices");
   udev_enumerate_scan_devices (enumerate);
   devices = udev_enumerate_get_list_entry (enumerate);
 
@@ -555,7 +612,7 @@ bolt_manager_initialize (GInitable    *initable,
       devtype = udev_device_get_devtype (udevice);
 
       if (bolt_streq (devtype, "thunderbolt_domain"))
-        manager_add_domain (mgr, udevice);
+        handle_udev_domain_added (mgr, udevice);
 
       if (!bolt_streq (devtype, "thunderbolt_device"))
         continue;
@@ -563,7 +620,7 @@ bolt_manager_initialize (GInitable    *initable,
       uid = udev_device_get_sysattr_value (udevice, "unique_id");
       if (uid == NULL)
         {
-          g_warning ("thunderbolt device without uid");
+          bolt_warn ("thunderbolt device without uid");
           continue;
         }
 
@@ -575,9 +632,89 @@ bolt_manager_initialize (GInitable    *initable,
     }
 
   udev_enumerate_unref (enumerate);
+
+  if (forced_power)
+    {
+      g_autoptr(GError) err = NULL;
+
+      ok = bolt_power_force_switch (mgr->power, FALSE, &err);
+
+      if (!ok)
+        bolt_warn_err (err, LOG_TOPIC ("power"), "failed undo force power");
+      else
+        bolt_info (LOG_TOPIC ("power"), "setting force_power to OFF");
+    }
+
   return TRUE;
 }
 
+/* domain related function */
+static BoltDomain *
+manager_find_domain_by_syspath (BoltManager *mgr,
+                                const char  *syspath)
+{
+  BoltDomain *iter = mgr->domains;
+  guint n_domains;
+
+  n_domains = bolt_domain_count (mgr->domains);
+  for (guint i = 0; i < n_domains; i++)
+    {
+      const char *prefix = bolt_domain_get_syspath (iter);
+
+      /* we get a perfect match, if we search for the domain
+       * itself, or if we are looking for the domain that
+       * is the parent of the device in @syspath */
+      if (g_str_has_prefix (syspath, prefix))
+        return iter;
+
+      iter = bolt_domain_next (iter);
+    }
+
+  return NULL;
+}
+
+static void
+manager_register_domain (BoltManager *mgr,
+                         BoltDomain  *domain)
+{
+  const char *name;
+  BoltSecurity sl;
+
+  mgr->domains = bolt_domain_insert (mgr->domains, domain);
+
+  name = bolt_domain_get_id (domain);
+  sl = bolt_domain_get_security (domain);
+
+  bolt_info (LOG_TOPIC ("domain"), "'%s' (security: %s) added",
+             name, bolt_security_to_string (sl));
+
+  if (mgr->security == BOLT_SECURITY_UNKNOWN)
+    {
+      bolt_info ("security level set to '%s'",
+                 bolt_security_to_string (sl));
+      mgr->security = sl;
+    }
+  else if (mgr->security != sl)
+    {
+      bolt_warn ("multiple security levels (%s vs %s)",
+                 bolt_security_to_string (mgr->security),
+                 bolt_security_to_string (sl));
+    }
+}
+
+static void
+manager_deregister_domain (BoltManager *mgr,
+                           BoltDomain  *domain)
+{
+  const char *name;
+
+  name = bolt_domain_get_id (domain);
+  bolt_info (LOG_TOPIC ("domain"), "'%s' removed", name);
+
+  mgr->domains = bolt_domain_remove (mgr->domains, domain);
+}
+
+/* device related functions */
 static void
 manager_register_device (BoltManager *mgr,
                          BoltDevice  *dev)
@@ -585,8 +722,9 @@ manager_register_device (BoltManager *mgr,
 
   g_ptr_array_add (mgr->devices, dev);
   bolt_bouncer_add_client (mgr->bouncer, dev);
-  g_signal_connect (dev, "status-changed",
-                    G_CALLBACK (handle_device_status_changed), mgr);
+  g_signal_connect_object (dev, "status-changed",
+                           G_CALLBACK (handle_device_status_changed),
+                           mgr, 0);
 }
 
 static void
@@ -594,7 +732,6 @@ manager_deregister_device (BoltManager *mgr,
                            BoltDevice  *dev)
 {
   g_ptr_array_remove_fast (mgr->devices, dev);
-  //  g_signal_handlers_unblock_by_func (dev, G_CALLBACK (handle_device_status_changed), mgr);
 }
 
 static BoltDevice *
@@ -695,66 +832,90 @@ bolt_manager_get_children (BoltManager *mgr,
   return res;
 }
 
-/* device authorization */
-typedef struct
+static void
+bolt_manager_label_device (BoltManager *mgr,
+                           BoltDevice  *target)
 {
-  BoltAuth   *auth;
-  BoltDevice *dev;
-} AuthIdleData;
+  g_autofree char *label = NULL;
+  const char *name;
+  const char *vendor;
+  guint count = 0;
 
+  name = bolt_device_get_name (target);
+  vendor = bolt_device_get_vendor (target);
+
+  for (guint i = 0; i < mgr->devices->len; i++)
+    {
+      BoltDevice *dev = g_ptr_array_index (mgr->devices, i);
+      const char *dev_name = bolt_device_get_name (dev);
+      const char *dev_vendor = bolt_device_get_vendor (dev);
+
+      if (bolt_streq (dev_name, name) &&
+          bolt_streq (dev_vendor, vendor))
+        count++;
+    }
+
+  /* cleanup name */
+  if (g_str_has_prefix (name, vendor))
+    {
+      name += strlen (vendor);
+
+      while (g_ascii_isspace (*name))
+        name++;
+
+      if (*name == '\0')
+        name = bolt_device_get_name (target);
+    }
+
+  /* we counted the target too, > 1 means duplicates */
+  if (count > 1)
+    label = g_strdup_printf ("%s %s #%u", vendor, name, count);
+  else
+    label = g_strdup_printf ("%s %s", vendor, name);
+
+  bolt_info (LOG_DEV (target), "labeling device: %s", label);
+  g_object_set (G_OBJECT (target), "label", label, NULL);
+}
+
+/* device authorization */
 static void
 authorize_device_finish (GObject      *source,
                          GAsyncResult *res,
                          gpointer      user_data)
 {
-  g_autoptr(GError) error = NULL;
+  g_autoptr(GError) err = NULL;
   BoltDevice *dev = BOLT_DEVICE (source);
   BoltAuth *auth = BOLT_AUTH (res);
-  const char *uid;
   gboolean ok;
 
-  uid = bolt_device_get_uid (dev);
-  ok = bolt_auth_check (auth, &error);
+  ok = bolt_auth_check (auth, &err);
 
-  if (ok)
-    g_info ("[%s] authorized", uid);
+  if (!ok)
+    bolt_warn_err (err, LOG_DEV (dev), "authorization failed");
   else
-    g_warning ("[%s] authorization failed: %s",
-               uid, error->message);
-}
-
-static gboolean
-authorize_device_idle (gpointer user_data)
-{
-  AuthIdleData *data = user_data;
-  BoltDevice *dev = data->dev;
-  BoltAuth *auth = data->auth;
-  const char *uid = bolt_device_get_uid (dev);
-
-  g_info ("[%s] authorizing", uid);
-  bolt_device_authorize (dev, auth, authorize_device_finish, NULL);
-
-  g_object_unref (data->auth);
-  g_object_unref (data->dev);
-  g_slice_free (AuthIdleData, data);
-
-  return G_SOURCE_REMOVE;
+    bolt_msg (LOG_DEV (dev), "authorized");
 }
 
 static void
 maybe_authorize_device (BoltManager *mgr,
                         BoltDevice  *dev)
 {
+  g_autoptr(BoltAuth) auth = NULL;
   BoltStatus status = bolt_device_get_status (dev);
   BoltPolicy policy = bolt_device_get_policy (dev);
   const char *uid = bolt_device_get_uid (dev);
   BoltKey *key = NULL;
   BoltSecurity level;
-  AuthIdleData *data;
   gboolean stored;
 
-  g_debug ("[%s] checking possible authorization: %s (%x)",
-           uid, bolt_policy_to_string (policy), status);
+  bolt_info (LOG_DEV (dev), "checking possible authorization: %s (%x)",
+             bolt_policy_to_string (policy), status);
+
+  if (bolt_auth_mode_is_disabled (mgr->authmode))
+    {
+      bolt_info (LOG_DEV (dev), "authorization is globally disabled.");
+      return;
+    }
 
   if (bolt_status_is_authorized (status) ||
       policy != BOLT_POLICY_AUTO)
@@ -771,17 +932,276 @@ maybe_authorize_device (BoltManager *mgr,
       g_autoptr(GError) err = NULL;
       key = bolt_store_get_key (mgr->store, uid, &err);
       if (key == NULL)
-        g_warning ("[%s] could not load key: %s", uid, err->message);
+        bolt_warn_err (err, LOG_DEV (dev), "could not load key");
     }
 
-  data = g_slice_new (AuthIdleData);
-  data->auth = bolt_auth_new (mgr, level, key);
-  data->dev = g_object_ref (dev);
+  if (level == BOLT_SECURITY_SECURE && key == NULL)
+    {
+      bolt_msg (LOG_DEV (dev), "have no key, not authorizing (secure mode)");
+      return;
+    }
 
-  g_idle_add (authorize_device_idle, data);
+  auth = bolt_auth_new (mgr, level, key);
+  bolt_device_authorize_idle (dev, auth, authorize_device_finish, mgr);
+}
+
+static void
+manager_maybe_auto_import_device (BoltManager *mgr,
+                                  BoltDevice  *dev)
+{
+  g_autoptr(GError) err = NULL;
+  g_autoptr(BoltKey) key = NULL;
+  gboolean boot;
+  gboolean ok;
+
+  if (!bolt_device_is_authorized (dev))
+    return;
+
+  if (bolt_device_get_device_type (dev) == BOLT_DEVICE_HOST)
+    return;
+
+  boot = bolt_device_check_authflag (dev, BOLT_AUTH_BOOT);
+
+  if (!boot)
+    {
+      bolt_msg (LOG_DEV (dev), LOG_TOPIC ("auto-import"),
+                "boot flag missing, not auto-importing");
+      return;
+    }
+
+  key = bolt_device_get_key_from_sysfs (dev, &err);
+  if (key == NULL && !bolt_err_notfound (err))
+    {
+      bolt_warn_err (err, LOG_DEV (dev), LOG_TOPIC ("auto-import"),
+                     "failed to read key from sysfs");
+      return;
+    }
+
+  if (key == NULL && mgr->security == BOLT_SECURITY_SECURE)
+    {
+      bolt_msg (LOG_DEV (dev), LOG_TOPIC ("auto-import"),
+                "secure mode enabled, no key, not auto-importing");
+      return;
+    }
+
+  bolt_msg (LOG_DEV (dev), LOG_TOPIC ("auto-import"),
+            "new authorized device (boot: %s, key: %s), importing",
+            bolt_yesno (boot), bolt_yesno (key != NULL));
+
+  ok = bolt_store_put_device (mgr->store, dev, BOLT_POLICY_AUTO, key, &err);
+
+  if (!ok)
+    bolt_warn_err (err, LOG_DEV (dev), LOG_TOPIC ("auto-import"),
+                   "failed to store device");
 }
 
 /* udev callbacks */
+static gboolean
+handle_uevent_udev (GIOChannel  *source,
+                    GIOCondition condition,
+                    gpointer     user_data)
+{
+  g_autoptr(udev_device) device = NULL;
+  BoltManager *mgr;
+  const char *action;
+  const char *subsystem;
+  const char *devtype;
+  const char *syspath;
+
+  mgr = BOLT_MANAGER (user_data);
+  device = udev_monitor_receive_device (mgr->udev_monitor);
+
+  if (device == NULL)
+    return G_SOURCE_CONTINUE;
+
+  action = udev_device_get_action (device);
+  if (action == NULL)
+    return G_SOURCE_CONTINUE;
+
+  syspath = udev_device_get_syspath (device);
+  if (syspath == NULL)
+    return G_SOURCE_CONTINUE;
+
+  devtype = udev_device_get_devtype (device);
+  subsystem = udev_device_get_subsystem (device);
+
+  if (g_str_equal (action, "add"))
+    manager_probing_device_added (mgr, device);
+  else if (g_str_equal (action, "remove"))
+    manager_probing_device_removed (mgr, device);
+
+  /* beyond this point only udev device from the
+   * thunderbolt are handled */
+  if (!bolt_streq (subsystem, "thunderbolt"))
+    return G_SOURCE_CONTINUE;
+
+  bolt_debug (LOG_TOPIC ("udev"), "%s (%s%s%s) %s", action,
+              subsystem, devtype ? "/" : "", devtype ? : "",
+              syspath);
+
+  if (bolt_streq (devtype, "thunderbolt_device"))
+    handle_udev_device_event (mgr, device, action);
+  else if (bolt_streq (devtype, "thunderbolt_domain"))
+    handle_udev_domain_event (mgr, device, action);
+
+  return G_SOURCE_CONTINUE;
+}
+
+static void
+handle_udev_domain_event (BoltManager        *mgr,
+                          struct udev_device *device,
+                          const char         *action)
+{
+  const char *syspath;
+  BoltDomain *domain;
+
+  syspath = udev_device_get_syspath (device);
+
+  if (g_str_equal (action, "add") ||
+      g_str_equal (action, "change"))
+    {
+      domain = manager_find_domain_by_syspath (mgr, syspath);
+
+      if (domain != NULL)
+        return; /*change event, ignore for now */
+
+      handle_udev_domain_added (mgr, device);
+    }
+  else if (g_str_equal (action, "remove"))
+    {
+      domain = manager_find_domain_by_syspath (mgr, syspath);
+
+      if (domain)
+        handle_udev_domain_removed (mgr, domain);
+      else
+        bolt_warn (LOG_TOPIC ("domain"),
+                   "unregistered domain removed at %s",
+                   syspath);
+    }
+}
+
+static void
+handle_udev_domain_added (BoltManager        *mgr,
+                          struct udev_device *device)
+{
+  g_autoptr(GError) err = NULL;
+  g_autoptr(BoltDomain) domain = NULL;
+  GDBusConnection *bus;
+  const char *op;
+
+  manager_probing_domain_added (mgr, device);
+
+  domain = bolt_domain_new_for_udev (device, &err);
+
+  if (domain == NULL)
+    {
+      bolt_warn_err (err, LOG_TOPIC ("udev"),
+                     "failed to create domain: %s");
+      return;
+    }
+
+  manager_register_domain (mgr, domain);
+
+  bus = bolt_exported_get_connection (BOLT_EXPORTED (mgr));
+  if (bus == NULL)
+    return;
+
+  bolt_domain_export (domain, bus);
+
+  op = bolt_exported_get_object_path (BOLT_EXPORTED (domain));
+  bolt_exported_emit_signal (BOLT_EXPORTED (mgr),
+                             "DomainAdded",
+                             g_variant_new ("(o)", op),
+                             NULL);
+}
+
+static void
+handle_udev_domain_removed (BoltManager *mgr,
+                            BoltDomain  *domain)
+{
+  const char *name;
+
+  name = bolt_domain_get_id (domain);
+  bolt_info (LOG_TOPIC ("domain"), "'%s' removed", name);
+
+  if (bolt_exported_is_exported (BOLT_EXPORTED (domain)))
+    {
+      const char *op;
+      gboolean ok;
+
+      op = bolt_exported_get_object_path (BOLT_EXPORTED (domain));
+      bolt_exported_emit_signal (BOLT_EXPORTED (mgr),
+                                 "DomainRemoved",
+                                 g_variant_new ("(o)", op),
+                                 NULL);
+
+      ok = bolt_exported_unexport (BOLT_EXPORTED (domain));
+
+      bolt_info (LOG_TOPIC ("dbus"), "%s unexported: %s",
+                 name, bolt_okfail (ok));
+    }
+
+  manager_deregister_domain (mgr, domain);
+}
+
+static void
+handle_udev_device_event (BoltManager        *mgr,
+                          struct udev_device *device,
+                          const char         *action)
+{
+  g_autoptr(BoltDevice) dev = NULL;
+
+  if (g_str_equal (action, "add") ||
+      g_str_equal (action, "change"))
+    {
+      const char *uid;
+
+      /* filter sysfs devices (e.g. the domain) that don't have
+       * the unique_id attribute */
+      uid = udev_device_get_sysattr_value (device, "unique_id");
+      if (uid == NULL)
+        return;
+
+      dev = manager_find_device_by_uid (mgr, uid, NULL);
+
+      if (!dev)
+        handle_udev_device_added (mgr, device);
+      else if (!bolt_device_is_connected (dev))
+        handle_udev_device_attached (mgr, dev, device);
+      else
+        handle_udev_device_changed (mgr, dev, device);
+    }
+  else if (g_str_equal (action, "remove"))
+    {
+      const char *syspath;
+      const char *name;
+
+      syspath = udev_device_get_syspath (device);
+      if (syspath == NULL)
+        {
+          bolt_warn (LOG_TOPIC ("udev"), "device without syspath");
+          return;
+        }
+
+      /* filter out the domain controller */
+      name = udev_device_get_sysname (device);
+      if (name && g_str_has_prefix (name, "domain"))
+        return;
+
+      dev = manager_find_device_by_syspath (mgr, syspath);
+
+      /* if we don't have any records of the device,
+       *  then we don't care */
+      if (!dev)
+        return;
+
+      if (bolt_device_get_stored (dev))
+        handle_udev_device_detached (mgr, dev);
+      else
+        hanlde_udev_device_removed (mgr, dev);
+    }
+}
+
 static void
 handle_udev_device_added (BoltManager        *mgr,
                           struct udev_device *udev)
@@ -789,35 +1209,55 @@ handle_udev_device_added (BoltManager        *mgr,
   g_autoptr(GError) err = NULL;
   GDBusConnection *bus;
   BoltDevice *dev;
+  BoltStatus status;
+  BoltDomain *domain;
   const char *opath;
-  const char *uid;
   const char *syspath;
 
-  dev = bolt_device_new_for_udev (udev, &err);
+  syspath = udev_device_get_syspath (udev);
+  domain = manager_find_domain_by_syspath (mgr, syspath);
+
+  if (domain == NULL)
+    {
+      bolt_warn (LOG_TOPIC ("domain"),
+                 "could not find domain for device at '%s'",
+                 syspath);
+      return;
+    }
+
+  dev = bolt_device_new_for_udev (udev, domain, &err);
   if (dev == NULL)
     {
-      g_warning ("Could not create device for udev: %s", err->message);
+      bolt_warn_err (err, LOG_TOPIC ("udev"), "could not create device");
       return;
     }
 
   manager_register_device (mgr, dev);
 
-  uid = bolt_device_get_uid (dev);
-  syspath = udev_device_get_syspath (udev);
-  g_info ("[%s] added (%s)", uid, syspath);
+  status = bolt_device_get_status (dev);
+  bolt_msg (LOG_DEV (dev), "device added, status: %s, at %s",
+            bolt_status_to_string (status), syspath);
+
+  bolt_manager_label_device (mgr, dev);
+
+  manager_maybe_auto_import_device (mgr, dev);
 
   /* if we have a valid dbus connection */
-  bus = g_dbus_interface_skeleton_get_connection (G_DBUS_INTERFACE_SKELETON (mgr));
+  bus = bolt_exported_get_connection (BOLT_EXPORTED (mgr));
   if (bus == NULL)
     return;
 
   opath = bolt_device_export (dev, bus, &err);
   if (opath == NULL)
-    g_warning ("[%s] error exporting: %s", uid, err->message);
+    bolt_warn_err (err, LOG_DEV (dev), LOG_TOPIC ("dbus"), "error exporting");
   else
-    g_debug ("[%s] exporting device: %s", uid, opath);
+    bolt_info (LOG_DEV (dev), LOG_TOPIC ("dbus"),
+               "exported device at %.43s...", opath);
 
-  bolt_dbus_manager_emit_device_added (BOLT_DBUS_MANAGER (mgr), opath);
+  bolt_exported_emit_signal (BOLT_EXPORTED (mgr),
+                             "DeviceAdded",
+                             g_variant_new ("(o)", opath),
+                             NULL);
 }
 
 static void
@@ -825,26 +1265,21 @@ handle_udev_device_changed (BoltManager        *mgr,
                             BoltDevice         *dev,
                             struct udev_device *udev)
 {
-  g_autoptr(GPtrArray) children = NULL;
   BoltStatus after;
-  const char *uid;
+  BoltStatus before;
 
-  uid = bolt_device_get_uid (dev);
+  before = bolt_device_get_status (dev);
   after = bolt_device_update_from_udev (dev, udev);
 
-  g_info ("[%s] device changed: %s", uid,
-          bolt_status_to_string (after));
+  bolt_info (LOG_DEV (dev), LOG_TOPIC ("udev"),
+             "device changed: %s -> %s",
+             bolt_status_to_string (before),
+             bolt_status_to_string (after));
 
-  if (!bolt_status_is_authorized (after))
-    return;
-
-  children = bolt_manager_get_children (mgr, dev);
-
-  for (guint i = 0; i < children->len; i++)
-    {
-      BoltDevice *child = g_ptr_array_index (children, i);
-      maybe_authorize_device (mgr, child);
-    }
+  /* reaction to status changes of the device, i.e.
+   * authorizing the children are done in the
+   * handle_device_status_changed () signal handler
+   */
 }
 
 static void
@@ -852,12 +1287,10 @@ hanlde_udev_device_removed (BoltManager *mgr,
                             BoltDevice  *dev)
 {
   const char *opath;
-  const char *uid;
   const char *syspath;
 
-  uid = bolt_device_get_uid (dev);
   syspath = bolt_device_get_syspath (dev);
-  g_info ("[%s] removed (%s)", uid, syspath);
+  bolt_msg (LOG_DEV (dev), "removed (%s)", syspath);
 
   manager_deregister_device (mgr, dev);
 
@@ -866,9 +1299,13 @@ hanlde_udev_device_removed (BoltManager *mgr,
   if (opath == NULL)
     return;
 
-  bolt_dbus_manager_emit_device_removed (BOLT_DBUS_MANAGER (mgr), opath);
+  bolt_exported_emit_signal (BOLT_EXPORTED (mgr),
+                             "DeviceRemoved",
+                             g_variant_new ("(o)", opath),
+                             NULL);
+
   bolt_device_unexport (dev);
-  g_debug ("[%s] unexported", uid);
+  bolt_info (LOG_DEV (dev), LOG_TOPIC ("dbus"), "unexported");
 }
 
 static void
@@ -877,15 +1314,25 @@ handle_udev_device_attached (BoltManager        *mgr,
                              struct udev_device *udev)
 {
   g_autoptr(BoltDevice) parent = NULL;
-  const char *uid;
+  BoltDomain *domain;
   const char *syspath;
   BoltStatus status;
 
-  status = bolt_device_connected (dev, udev);
+  syspath = udev_device_get_syspath (udev);
+  domain = manager_find_domain_by_syspath (mgr, syspath);
 
-  uid = bolt_device_get_uid (dev);
-  syspath = bolt_device_get_syspath (dev);
-  g_info ("[%s] connected: %x (%s)", uid, status, syspath);
+  if (domain == NULL)
+    {
+      bolt_warn (LOG_TOPIC ("domain"),
+                 "could not find domain for device at '%s'",
+                 syspath);
+      return;
+    }
+
+  status = bolt_device_connected (dev, domain, udev);
+
+  bolt_msg (LOG_DEV (dev), "connected: %s (%s)",
+            bolt_status_to_string (status), syspath);
 
   if (status != BOLT_STATUS_CONNECTED)
     return;
@@ -897,13 +1344,13 @@ handle_udev_device_attached (BoltManager        *mgr,
       status = bolt_device_get_status (parent);
       if (!bolt_status_is_authorized (status))
         {
-          g_debug ("[%s] parent [%s] not authorized", uid, pid);
+          bolt_info (LOG_DEV (dev), "parent [%s] not authorized", pid);
           return;
         }
     }
   else
     {
-      g_warning ("[%s] could not find parent", uid);
+      bolt_warn (LOG_DEV (dev), "could not find parent");
     }
 
   maybe_authorize_device (mgr, dev);
@@ -913,12 +1360,10 @@ static void
 handle_udev_device_detached (BoltManager *mgr,
                              BoltDevice  *dev)
 {
-  const char *uid;
   const char *syspath;
 
-  uid = bolt_device_get_uid (dev);
   syspath = bolt_device_get_syspath (dev);
-  g_info ("[%s] disconnected (%s)", uid, syspath);
+  bolt_msg (LOG_DEV (dev), "disconnected (%s)", syspath);
 
   bolt_device_disconnected (dev);
 }
@@ -933,7 +1378,7 @@ handle_store_device_removed (BoltStore   *store,
   const char *opath;
 
   dev = manager_find_device_by_uid (mgr, uid, NULL);
-  g_info ("[%s] removed from store: %p", uid, dev);
+  bolt_msg (LOG_DEV (dev), "removed from store");
 
   if (!dev)
     return;
@@ -956,10 +1401,13 @@ handle_store_device_removed (BoltStore   *store,
   if (opath == NULL)
     return;
 
-  bolt_dbus_manager_emit_device_removed (BOLT_DBUS_MANAGER (mgr), opath);
-  bolt_device_unexport (dev);
-  g_debug ("[%s] unexported", uid);
+  bolt_exported_emit_signal (BOLT_EXPORTED (mgr),
+                             "DeviceRemoved",
+                             g_variant_new ("(o)", opath),
+                             NULL);
 
+  bolt_device_unexport (dev);
+  bolt_info (LOG_DEV (dev), "unexported");
 }
 
 
@@ -968,15 +1416,14 @@ handle_device_status_changed (BoltDevice  *dev,
                               BoltStatus   old,
                               BoltManager *mgr)
 {
-  const char *uid;
+  g_autoptr(GPtrArray) children = NULL;
   BoltStatus now;
 
-  uid = bolt_device_get_uid (dev);
   now = bolt_device_get_status (dev);
-  g_debug ("[%s] status changed: %s -> %s",
-           uid,
-           bolt_status_to_string (old),
-           bolt_status_to_string (now));
+  bolt_debug (LOG_DEV (dev),
+              "status changed: %s -> %s",
+              bolt_status_to_string (old),
+              bolt_status_to_string (now));
 
   if (now == old)
     return; /* sanity check */
@@ -987,6 +1434,19 @@ handle_device_status_changed (BoltDevice  *dev,
     mgr->authorizing -= 1;
 
   manager_probing_activity (mgr, !mgr->authorizing);
+
+  if (now != BOLT_STATUS_AUTHORIZED)
+    return;
+
+  /* see if the new status changes anything for the
+   * children, e.g. the can now be authorized */
+  children = bolt_manager_get_children (mgr, dev);
+
+  for (guint i = 0; i < children->len; i++)
+    {
+      BoltDevice *child = g_ptr_array_index (children, i);
+      maybe_authorize_device (mgr, child);
+    }
 }
 
 static gboolean
@@ -1011,9 +1471,8 @@ probing_timeout (gpointer user_data)
 
   /* we are done, remove us */
   mgr->probing_timeout = 0;
-  g_object_set (mgr, "probing",  mgr->probing_timeout > 0, NULL);
-  g_debug ("probing: timeout, done: [%ld] (%ld)", dt, timeout);
-  g_dbus_interface_skeleton_flush (G_DBUS_INTERFACE_SKELETON (mgr));
+  g_object_notify_by_pspec (G_OBJECT (mgr), props[PROP_PROBING]);
+  bolt_info (LOG_TOPIC ("probing"), "timeout, done: [%ld] (%ld)", dt, timeout);
   return G_SOURCE_REMOVE;
 }
 
@@ -1028,10 +1487,9 @@ manager_probing_activity (BoltManager *mgr,
     return;
 
   dt = mgr->probing_tsettle / 2;
-  g_debug ("probing: started [%u]", dt);
+  bolt_info (LOG_TOPIC ("probing"), "started [%u]", dt);
   mgr->probing_timeout = g_timeout_add (dt, probing_timeout, mgr);
-  g_object_set (mgr, "probing",  mgr->probing_timeout > 0, NULL);
-  g_dbus_interface_skeleton_flush (G_DBUS_INTERFACE_SKELETON (mgr));
+  g_object_notify_by_pspec (G_OBJECT (mgr), props[PROP_PROBING]);
 }
 
 static gboolean
@@ -1066,7 +1524,7 @@ probing_add_root (BoltManager        *mgr,
   roots = mgr->probing_roots;
   syspath = udev_device_get_syspath (dev);
   g_ptr_array_add (roots, g_strdup (syspath));
-  g_debug ("probing: adding %s to roots", syspath);
+  bolt_info (LOG_TOPIC ("probing"), "adding %s to roots", syspath);
 
   return TRUE;
 }
@@ -1090,7 +1548,7 @@ manager_probing_device_added (BoltManager        *mgr,
       const char *r = g_ptr_array_index (roots, i);
       if (g_str_has_prefix (syspath, r))
         {
-          g_debug ("probing: match %s", syspath);
+          bolt_debug (LOG_TOPIC ("probing"), "match %s", syspath);
           /* do something */
           manager_probing_activity (mgr, FALSE);
           return;
@@ -1135,13 +1593,13 @@ manager_probing_device_removed (BoltManager        *mgr,
   if (!found)
     return;
 
-  g_debug ("probing: removing %s from roots", syspath);
+  bolt_info (LOG_TOPIC ("probing"), "removing %s from roots", syspath);
   g_ptr_array_remove_index_fast (mgr->probing_roots, index);
 }
 
 static void
-manager_add_domain (BoltManager        *mgr,
-                    struct udev_device *domain)
+manager_probing_domain_added (BoltManager        *mgr,
+                              struct udev_device *domain)
 {
   struct udev_device *p = domain;
 
@@ -1155,11 +1613,219 @@ manager_add_domain (BoltManager        *mgr,
   probing_add_root (mgr, p);
 }
 
-/* dbus methods */
 static gboolean
-handle_list_devices (BoltDBusManager       *obj,
+manager_maybe_power_controller (BoltManager *mgr)
+{
+  g_autoptr(GError) err = NULL;
+  gboolean can_force_power;
+  gboolean ok;
+  int n;
+
+  can_force_power = bolt_power_can_force (mgr->power);
+  bolt_info (LOG_TOPIC ("power"), "force_power support: %s",
+             bolt_yesno (can_force_power));
+
+  if (can_force_power == FALSE)
+    return FALSE;
+
+  n = bolt_sysfs_count_domains (mgr->udev, &err);
+  if (n < 0)
+    {
+      bolt_warn_err (err, LOG_TOPIC ("udev"),
+                     "failed to count domains");
+      return FALSE;
+    }
+  else if (n > 0)
+    {
+      ok = FALSE;
+      goto out;
+    }
+
+  bolt_info (LOG_TOPIC ("power"), "setting force_power to ON");
+  ok = bolt_power_force_switch (mgr->power, TRUE, &err);
+
+  if (!ok)
+    {
+      bolt_warn_err (err, LOG_TOPIC ("power"),
+                     "could not force power");
+      return ok;
+    }
+
+  /* we wait for a total of 5.0 seconds, should hopefully
+   * be enough for at least the domain to show up. */
+  for (int i = 0; i < 25 && n < 1; i++)
+    {
+      g_usleep (200000); /* 200 000 us = 0.2s */
+      n = bolt_sysfs_count_domains (mgr->udev, NULL);
+    }
+
+out:
+  bolt_info (LOG_TOPIC ("udev"), "found %d domain%s",
+             n, n > 1 ? "s" : "");
+  return ok;
+}
+
+
+/* config */
+static void
+manager_load_user_config (BoltManager *mgr)
+{
+  g_autoptr(GError) err = NULL;
+  BoltPolicy policy;
+  BoltAuthMode authmode;
+  BoltTri res;
+
+  bolt_info (LOG_TOPIC ("config"), "loading user config");
+  mgr->config = bolt_store_config_load (mgr->store, &err);
+  if (mgr->config == NULL)
+    {
+      if (!bolt_err_notfound (err))
+        bolt_warn_err (err, LOG_TOPIC ("config"),
+                       "failed to load user config");
+      return;
+    }
+
+  bolt_info (LOG_TOPIC ("config"), "user config loaded successfully");
+  res = bolt_config_load_default_policy (mgr->config, &policy, &err);
+  if (res == TRI_ERROR)
+    {
+      bolt_warn_err (err, LOG_TOPIC ("config"),
+                     "failed to load default policy");
+      g_clear_error (&err);
+    }
+  else if (res == TRI_YES)
+    {
+      mgr->policy = policy;
+      bolt_info (LOG_TOPIC ("config"), "default policy set to %s",
+                 bolt_policy_to_string (policy));
+      g_object_notify_by_pspec (G_OBJECT (mgr), props[PROP_POLICY]);
+    }
+
+  res = bolt_config_load_auth_mode (mgr->config, &authmode, &err);
+  if (res == TRI_ERROR)
+    {
+      bolt_warn_err (err, LOG_TOPIC ("config"),
+                     "failed to load auth mode");
+      g_clear_error (&err);
+    }
+  else if (res == TRI_YES)
+    {
+      g_autofree char *str = NULL;
+
+      str = bolt_flags_to_string (BOLT_TYPE_AUTH_MODE, authmode, NULL);
+      bolt_info (LOG_TOPIC ("config"), "auth mode set to '%s'", str);
+      mgr->authmode = authmode;
+      g_object_notify_by_pspec (G_OBJECT (mgr), props[PROP_POLICY]);
+    }
+}
+
+/* dbus property setter */
+static gboolean
+handle_set_authmode (BoltExported *obj,
+                     const char   *name,
+                     const GValue *value,
+                     GError      **error)
+{
+  g_autoptr(GError) err = NULL;
+  g_autofree char *str = NULL;
+  BoltManager *mgr = BOLT_MANAGER (obj);
+  BoltAuthMode authmode;
+  gboolean ok;
+
+  authmode = g_value_get_flags (value);
+
+  if (authmode == mgr->authmode)
+    return TRUE;
+
+  if (mgr->config == NULL)
+    mgr->config = bolt_config_user_init ();
+
+  str = bolt_flags_to_string (BOLT_TYPE_AUTH_MODE, authmode, &err);
+  if (str == NULL)
+    {
+      bolt_warn_err (err, LOG_TOPIC ("config"), "error setting authmode");
+      g_propagate_error (error, g_steal_pointer (&err));
+      return FALSE;
+    }
+
+  bolt_config_set_auth_mode (mgr->config, str);
+  ok = bolt_store_config_save (mgr->store, mgr->config, &err);
+
+  if (!ok)
+    {
+      bolt_warn_err (err, LOG_TOPIC ("config"), "error saving config");
+      g_propagate_error (error, g_steal_pointer (&err));
+      return FALSE;
+    }
+
+  mgr->authmode = authmode;
+  bolt_info (LOG_TOPIC ("config"), "auth mode set to '%s'", str);
+  return ok;
+}
+
+/* dbus methods: domain related */
+static GVariant *
+handle_list_domains (BoltExported          *object,
+                     GVariant              *params,
+                     GDBusMethodInvocation *invocation,
+                     GError               **error)
+{
+  BoltManager *mgr = BOLT_MANAGER (object);
+  const char **domains;
+  BoltDomain *iter;
+  guint count;
+
+  count = bolt_domain_count (mgr->domains);
+  domains = g_newa (const char *, count + 1);
+
+  iter = mgr->domains;
+  for (guint i = 0; i < count; i++)
+    {
+      domains[i] = bolt_exported_get_object_path (BOLT_EXPORTED (iter));
+      iter = bolt_domain_next (iter);
+    }
+
+  domains[count] = NULL;
+
+  return g_variant_new ("(^ao)", domains);
+}
+
+static GVariant *
+handle_domain_by_id (BoltExported          *object,
+                     GVariant              *params,
+                     GDBusMethodInvocation *invocation,
+                     GError               **error)
+{
+  BoltManager *mgr = BOLT_MANAGER (object);
+  BoltDomain *domain;
+  const char *op;
+  const char *id;
+
+  g_variant_get (params, "(&s)", &id);
+
+  if (id == NULL || id[0] == '\0')
+    {
+      g_set_error_literal (error, G_IO_ERROR,
+                           G_IO_ERROR_INVALID_ARGUMENT,
+                           "empty domain id");
+      return NULL;
+    }
+
+  domain = bolt_domain_find_id (mgr->domains, id, error);
+
+  if (domain == NULL)
+    return NULL;
+
+  op = bolt_exported_get_object_path (BOLT_EXPORTED (domain));
+  return g_variant_new ("(o)", op);
+}
+
+/* dbus methods: device related */
+static GVariant *
+handle_list_devices (BoltExported          *obj,
+                     GVariant              *params,
                      GDBusMethodInvocation *inv,
-                     gpointer               user_data)
+                     GError               **error)
 {
   BoltManager *mgr = BOLT_MANAGER (obj);
   const char **devs;
@@ -1174,37 +1840,30 @@ handle_list_devices (BoltDBusManager       *obj,
 
   devs[mgr->devices->len] = NULL;
 
-  bolt_dbus_manager_complete_list_devices (obj, inv, devs);
-  return TRUE;
+  return g_variant_new ("(^ao)", devs);
 }
 
-static gboolean
-handle_device_by_uid (BoltDBusManager       *obj,
+static GVariant *
+handle_device_by_uid (BoltExported          *obj,
+                      GVariant              *params,
                       GDBusMethodInvocation *inv,
-                      gpointer               user_data)
+                      GError               **error)
 {
   g_autoptr(BoltDevice) dev = NULL;
-  g_autoptr(GError) error = NULL;
   BoltManager *mgr;
-  GVariant *params;
   const char *uid;
   const char *opath;
 
   mgr = BOLT_MANAGER (obj);
 
-  params = g_dbus_method_invocation_get_parameters (inv);
   g_variant_get (params, "(&s)", &uid);
-  dev = manager_find_device_by_uid (mgr, uid, &error);
+  dev = manager_find_device_by_uid (mgr, uid, error);
 
   if (dev == NULL)
-    {
-      g_dbus_method_invocation_return_gerror (inv, error);
-      return TRUE;
-    }
+    return NULL;
 
   opath = bolt_device_get_object_path (dev);
-  bolt_dbus_manager_complete_device_by_uid (obj, inv, opath);
-  return TRUE;
+  return g_variant_new ("(o)", opath);
 }
 
 static void
@@ -1229,15 +1888,15 @@ enroll_device_done (GObject      *device,
   if (ok)
     {
       GVariant *params;
-      guint32 p;
+      const char *str;
       BoltPolicy policy;
 
       params = g_dbus_method_invocation_get_parameters (inv);
-      g_variant_get_child (params, 1, "u", &p);
+      g_variant_get_child (params, 1, "&s", &str);
 
-      policy = p;
+      policy = bolt_enum_from_string (BOLT_TYPE_POLICY, str, NULL);
       if (policy == BOLT_POLICY_DEFAULT)
-        policy = BOLT_POLICY_AUTO;
+        policy = mgr->policy;
 
       ok = bolt_store_put_device (mgr->store,
                                   dev,
@@ -1253,130 +1912,204 @@ enroll_device_done (GObject      *device,
     }
 
   opath = bolt_device_get_object_path (dev);
-  bolt_dbus_manager_complete_enroll_device (BOLT_DBUS_MANAGER (mgr), inv, opath);
-
+  g_dbus_method_invocation_return_value (inv, g_variant_new ("(o)", opath));
 }
 
-static gboolean
-handle_enroll_device (BoltDBusManager       *obj,
+static GVariant *
+enroll_device_store_authorized (BoltManager *mgr,
+                                BoltDevice  *dev,
+                                BoltPolicy   policy,
+                                GError     **error)
+{
+  g_autoptr(GError) err = NULL;
+  g_autoptr(BoltKey) key = NULL;
+  const char *opath;
+  gboolean ok;
+
+  bolt_info (LOG_DEV (dev), "enrolling an authorized device");
+
+  key = bolt_device_get_key_from_sysfs (dev, &err);
+  if (key == NULL && !bolt_err_notfound (err))
+    {
+      bolt_warn_err (err, LOG_DEV (dev), LOG_TOPIC ("udev"),
+                     "failed to read key from sysfs");
+      g_propagate_prefixed_error (error, g_steal_pointer (&err), "%s",
+                                  "could not determine existing authorization");
+      return NULL;
+    }
+
+  ok = bolt_store_put_device (mgr->store, dev, policy, key, &err);
+
+  if (!ok)
+    {
+      bolt_warn_err (err, LOG_DEV (dev), LOG_TOPIC ("store"),
+                     "failed to store device");
+      g_propagate_error (error, g_steal_pointer (&err));
+      return NULL;
+    }
+
+  opath = bolt_device_get_object_path (dev);
+  return g_variant_new ("(o)", opath);
+}
+
+static GVariant *
+handle_enroll_device (BoltExported          *obj,
+                      GVariant              *params,
                       GDBusMethodInvocation *inv,
-                      gpointer               user_data)
+                      GError               **error)
 {
   g_autoptr(BoltDevice) dev = NULL;
   g_autoptr(BoltAuth) auth = NULL;
   g_autoptr(BoltKey) key = NULL;
-  g_autoptr(GError) error = NULL;
   BoltManager *mgr;
-  GVariant *params;
   const char *uid;
   BoltSecurity level;
-  guint32 policy;
+  BoltPolicy pol;
+  const char *policy;
 
   mgr = BOLT_MANAGER (obj);
 
-  params = g_dbus_method_invocation_get_parameters (inv);
   g_variant_get_child (params, 0, "&s", &uid);
-  g_variant_get_child (params, 1, "u", &policy);
-  dev = manager_find_device_by_uid (mgr, uid, &error);
+  g_variant_get_child (params, 1, "&s", &policy);
+  dev = manager_find_device_by_uid (mgr, uid, error);
 
   if (dev == NULL)
-    {
-      g_dbus_method_invocation_return_gerror (inv, error);
-      return TRUE;
-    }
+    return NULL;
 
-  if (!bolt_policy_validate ((BoltPolicy) policy))
+  pol = bolt_enum_from_string (BOLT_TYPE_POLICY, policy, error);
+  if (pol == BOLT_POLICY_UNKNOWN)
     {
-      g_dbus_method_invocation_return_error (inv, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS,
-                                             "invalid policy: %" G_GUINT32_FORMAT, policy);
-      return TRUE;
+      if (*error == NULL)
+        g_set_error (error, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS,
+                     "invalid policy: %s", policy);
+      return NULL;
     }
 
   if (bolt_device_get_stored (dev))
     {
-      g_dbus_method_invocation_return_error (inv, G_IO_ERROR, G_IO_ERROR_EXISTS,
-                                             "device with id '%s' already enrolled.",
-                                             uid);
-      return TRUE;
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_EXISTS,
+                   "device with id '%s' already enrolled.",
+                   uid);
+      return NULL;
     }
 
-  level = bolt_device_get_security (dev);
-  key = NULL;
+  /* if the device is already authorized, we just store it */
+  if (bolt_device_is_authorized (dev))
+    return enroll_device_store_authorized (mgr, dev, pol, error);
 
+  if (bolt_auth_mode_is_disabled (mgr->authmode))
+    {
+      g_set_error (error, G_DBUS_ERROR, G_DBUS_ERROR_ACCESS_DENIED,
+                   "authorization of new devices is disabled");
+      return NULL;
+    }
+
+  if (bolt_device_supports_secure_mode (dev))
+    level = bolt_device_get_security (dev);
+  else
+    level = BOLT_SECURITY_USER;
+
+  key = NULL;
   if (level == BOLT_SECURITY_SECURE)
     key = bolt_key_new ();
 
   auth = bolt_auth_new (mgr, level, key);
   bolt_device_authorize (dev, auth, enroll_device_done, inv);
 
-  return TRUE;
+  return NULL;
 
 }
 
-static gboolean
-handle_forget_device (BoltDBusManager       *obj,
+static GVariant *
+handle_forget_device (BoltExported          *obj,
+                      GVariant              *params,
                       GDBusMethodInvocation *inv,
-                      gpointer               user_data)
+                      GError               **error)
 {
   g_autoptr(BoltDevice) dev = NULL;
-  g_autoptr(GError) error = NULL;
   BoltManager *mgr;
   gboolean ok;
-  GVariant *params;
   const char *uid;
 
   mgr = BOLT_MANAGER (obj);
 
-  params = g_dbus_method_invocation_get_parameters (inv);
   g_variant_get (params, "(&s)", &uid);
-  dev = manager_find_device_by_uid (mgr, uid, &error);
+  dev = manager_find_device_by_uid (mgr, uid, error);
 
   if (dev == NULL)
-    {
-      g_dbus_method_invocation_take_error (inv, g_steal_pointer (&error));
-      return TRUE;
-    }
+    return FALSE;
 
-  ok = bolt_store_del (mgr->store, dev, &error);
+  ok = bolt_store_del (mgr->store, dev, error);
 
-  if (!ok)
-    g_dbus_method_invocation_take_error (inv, g_steal_pointer (&error));
-  else
-    bolt_dbus_manager_complete_forget_device (BOLT_DBUS_MANAGER (mgr), inv);
-
-  return TRUE;
+  return ok ? g_variant_new ("()") : NULL;
 }
 
 /* public methods */
-
 gboolean
 bolt_manager_export (BoltManager     *mgr,
                      GDBusConnection *connection,
                      GError         **error)
 {
-  if (!g_dbus_interface_skeleton_export (G_DBUS_INTERFACE_SKELETON (mgr),
-                                         connection,
-                                         BOLT_DBUS_PATH,
-                                         error))
+  if (!bolt_exported_export (BOLT_EXPORTED (mgr),
+                             connection,
+                             BOLT_DBUS_PATH,
+                             error))
     return FALSE;
+
+  bolt_domain_foreach (mgr->domains,
+                       (GFunc) bolt_domain_export,
+                       connection);
 
   for (guint i = 0; i < mgr->devices->len; i++)
     {
       g_autoptr(GError) err  = NULL;
       BoltDevice *dev = g_ptr_array_index (mgr->devices, i);
-      const char *uid;
       const char *opath;
 
-      uid = bolt_device_get_uid (dev);
       opath = bolt_device_export (dev, connection, &err);
       if (opath == NULL)
         {
-          g_warning ("[%s] error exporting: %s", uid, err->message);
+          bolt_warn_err (err, LOG_DEV (dev), LOG_TOPIC ("dbus"),
+                         "error exporting a device");
           continue;
         }
 
-      g_debug ("[%s] exporting device: %s", uid, opath);
+      bolt_info (LOG_DEV (dev), LOG_TOPIC ("dbus"),
+                 "exported device at %.43s...", opath);
     }
 
   return TRUE;
+}
+
+void
+bolt_manager_got_the_name (BoltManager *mgr)
+{
+
+  /* emit DeviceAdded signals now that we have the name
+   * for all devices that are not stored and connected
+   */
+  for (guint i = 0; i < mgr->devices->len; i++)
+    {
+      BoltDevice *dev = g_ptr_array_index (mgr->devices, i);
+      BoltStatus status;
+      gboolean stored;
+      const char *opath;
+
+      stored = bolt_device_get_stored (dev);
+      if (stored)
+        continue;
+
+      status = bolt_device_get_status (dev);
+      if (status != BOLT_STATUS_CONNECTED)
+        continue;
+
+      opath = bolt_exported_get_object_path (BOLT_EXPORTED (dev));
+      if (opath == NULL)
+        continue;
+
+      bolt_exported_emit_signal (BOLT_EXPORTED (mgr),
+                                 "DeviceAdded",
+                                 g_variant_new ("(o)", opath),
+                                 NULL);
+    }
 }

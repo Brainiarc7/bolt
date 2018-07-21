@@ -20,15 +20,17 @@
 
 #pragma once
 
-#include "bolt-gdbus.h"
+#include "bolt-exported.h"
 
 G_BEGIN_DECLS
 
 #define BOLT_TYPE_MANAGER bolt_manager_get_type ()
-G_DECLARE_FINAL_TYPE (BoltManager, bolt_manager, BOLT, MANAGER, BoltDBusManagerSkeleton);
+G_DECLARE_FINAL_TYPE (BoltManager, bolt_manager, BOLT, MANAGER, BoltExported);
 
 gboolean         bolt_manager_export (BoltManager     *mgr,
                                       GDBusConnection *connection,
                                       GError         **error);
+
+void             bolt_manager_got_the_name (BoltManager *mgr);
 
 G_END_DECLS

@@ -34,4 +34,36 @@ void bolt_str_erase_clear (char **str);
 
 GStrv   bolt_strv_from_ptr_array (GPtrArray **array);
 
+#define bolt_yesno(val) val ? "yes" : "no"
+#define bolt_okfail(val) (!!val) ? "ok" : "fail"
+
+char *bolt_strdup_validate (const char *string);
+
+char *bolt_strstrip (char *string);
+
+gboolean bolt_str_parse_as_int (const char *str,
+                                gint       *ret);
+
+/* replacing string pointers, like g_set_object, g_set_error ... */
+static inline gboolean
+bolt_set_str (char **target, char *str)
+{
+  char *ptr;
+
+  g_return_val_if_fail (target != NULL, FALSE);
+
+  ptr = *target;
+
+  if (ptr == str)
+    return FALSE;
+
+  g_free (ptr);
+  *target = str;
+
+  return TRUE;
+}
+
+#define bolt_set_strdup(target, str) \
+  bolt_set_str (target, g_strdup (str))
+
 G_END_DECLS

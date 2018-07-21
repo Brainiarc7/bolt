@@ -24,8 +24,11 @@
 #include "bolt-error.h"
 #include "bolt-fs.h"
 #include "bolt-io.h"
+#include "bolt-list.h"
 #include "bolt-rnd.h"
 #include "bolt-str.h"
+
+#include "test-enums.h"
 
 #include <glib.h>
 #include <gio/gio.h>
@@ -39,6 +42,11 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h> /* unlinkat */
+
+#if !GLIB_CHECK_VERSION (2, 57, 0)
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (GEnumClass, g_type_class_unref);
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (GFlagsClass, g_type_class_unref);
+#endif
 
 static void
 cleanup_dir (DIR *d)
@@ -79,6 +87,43 @@ typedef struct
 static void
 test_enums (TestRng *tt, gconstpointer user_data)
 {
+  g_autoptr(GEnumClass) klass;
+  g_autoptr(GError) err = NULL;
+  const char *str;
+  gint val;
+  gboolean ok;
+  struct EnumTest
+  {
+    GType       enum_type;
+    const char *name;
+    gint        value;
+
+  } ett[] = {
+    {BOLT_TYPE_SECURITY, "none",   BOLT_SECURITY_NONE},
+    {BOLT_TYPE_SECURITY, "dponly", BOLT_SECURITY_DPONLY},
+    {BOLT_TYPE_SECURITY, "user",   BOLT_SECURITY_USER},
+    {BOLT_TYPE_SECURITY, "secure", BOLT_SECURITY_SECURE},
+  };
+
+  for (guint i = 0; i < G_N_ELEMENTS (ett); i++)
+    {
+
+      ok = bolt_enum_validate (ett[i].enum_type, ett[i].value, &err);
+      g_assert_no_error (err);
+      g_assert_true (ok);
+
+      /* to string */
+      str = bolt_enum_to_string (ett[i].enum_type, ett[i].value, &err);
+      g_assert_no_error (err);
+      g_assert_nonnull (str);
+      g_assert_cmpstr (str, ==, ett[i].name);
+
+      /* from string */
+      val = bolt_enum_from_string (ett[i].enum_type, ett[i].name, &err);
+      g_assert_no_error (err);
+      g_assert_cmpint (val, ==, ett[i].value);
+    }
+
   g_assert_cmpstr (bolt_security_to_string (BOLT_SECURITY_NONE), ==, "none");
   g_assert_cmpstr (bolt_security_to_string (BOLT_SECURITY_DPONLY), ==, "dponly");
   g_assert_cmpstr (bolt_security_to_string (BOLT_SECURITY_USER), ==, "user");
@@ -88,6 +133,225 @@ test_enums (TestRng *tt, gconstpointer user_data)
   g_assert_cmpuint (bolt_security_from_string ("dponly"), ==, BOLT_SECURITY_DPONLY);
   g_assert_cmpuint (bolt_security_from_string ("user"), ==, BOLT_SECURITY_USER);
   g_assert_cmpuint (bolt_security_from_string ("secure"), ==, BOLT_SECURITY_SECURE);
+
+  klass = g_type_class_ref (BOLT_TYPE_SECURITY);
+
+  ok = bolt_enum_class_validate (klass, klass->minimum, &err);
+  g_assert_no_error (err);
+  g_assert_true (ok);
+
+  ok = bolt_enum_class_validate (klass, klass->maximum, &err);
+  g_assert_no_error (err);
+  g_assert_true (ok);
+
+  str = bolt_enum_to_string (BOLT_TYPE_SECURITY, klass->minimum, &err);
+  g_assert_no_error (err);
+  g_assert_nonnull (str);
+
+  str = bolt_enum_to_string (BOLT_TYPE_SECURITY, klass->maximum, &err);
+  g_assert_no_error (err);
+  g_assert_nonnull (str);
+
+  ok = bolt_enum_class_validate (klass, klass->maximum + 1, &err);
+  g_assert_nonnull (err);
+  g_assert_false (ok);
+  g_clear_error (&err);
+
+  ok = bolt_enum_class_validate (klass, klass->minimum - 1, &err);
+  g_assert_nonnull (err);
+  g_assert_false (ok);
+  g_clear_error (&err);
+
+  ok = bolt_enum_validate (BOLT_TYPE_SECURITY, -42, &err);
+  g_assert_nonnull (err);
+  g_assert_false (ok);
+  g_clear_error (&err);
+
+  str = bolt_enum_to_string (BOLT_TYPE_SECURITY, -42, &err);
+  g_assert_nonnull (err);
+  g_assert_null (str);
+  g_clear_error (&err);
+
+  val = bolt_enum_from_string (BOLT_TYPE_SECURITY, "ILEDELI", &err);
+  g_assert_nonnull (err);
+  g_assert_cmpint (val, ==, -1);
+  g_clear_error (&err);
+}
+
+static void
+test_flags (TestRng *tt, gconstpointer user_data)
+{
+  g_autoptr(GFlagsClass) klass;
+  g_autoptr(GError) err = NULL;
+  char *str;
+  guint val;
+  guint ref;
+  gboolean ok;
+  gboolean chg;
+  struct EnumTest
+  {
+    GType       flags_type;
+    const char *name;
+    guint       value;
+
+  } ftt[] = {
+    {BOLT_TYPE_KITT_FLAGS, "disabled",    BOLT_KITT_DISABLED},
+    {BOLT_TYPE_KITT_FLAGS, "enabled",     BOLT_KITT_ENABLED},
+    {BOLT_TYPE_KITT_FLAGS, "sspm",        BOLT_KITT_SSPM},
+    {BOLT_TYPE_KITT_FLAGS, "turbo-boost", BOLT_KITT_TURBO_BOOST},
+    {BOLT_TYPE_KITT_FLAGS, "ski-mode",    BOLT_KITT_SKI_MODE},
+
+    {BOLT_TYPE_KITT_FLAGS,
+     "enabled | ski-mode",
+     BOLT_KITT_ENABLED | BOLT_KITT_SKI_MODE},
+
+    {BOLT_TYPE_KITT_FLAGS,
+     "sspm | turbo-boost | ski-mode",
+     BOLT_KITT_SSPM | BOLT_KITT_SKI_MODE | BOLT_KITT_TURBO_BOOST},
+
+  };
+
+  for (guint i = 0; i < G_N_ELEMENTS (ftt); i++)
+    {
+      g_autofree char *s = NULL;
+
+      /* to string */
+      s = bolt_flags_to_string (ftt[i].flags_type, ftt[i].value, &err);
+      g_assert_no_error (err);
+      g_assert_nonnull (s);
+      g_assert_cmpstr (s, ==, ftt[i].name);
+
+      /* from string */
+      ok = bolt_flags_from_string (ftt[i].flags_type, ftt[i].name, &val, &err);
+      g_assert_no_error (err);
+      g_assert_true (ok);
+      g_assert_cmpuint (val, ==, ftt[i].value);
+    }
+
+  /* handle NULL for flags class */
+  ok = bolt_flags_class_from_string (NULL, "fax-machine", &val, &err);
+  g_assert_error (err, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS);
+  g_assert_false (ok);
+  g_clear_error (&err);
+
+  str = bolt_flags_class_to_string (NULL, 0xFFFF, &err);
+  g_assert_error (err, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS);
+  g_assert_null (str);
+  g_clear_error (&err);
+
+  /* handle invalid values */
+  klass = g_type_class_ref (BOLT_TYPE_KITT_FLAGS);
+
+  ok = bolt_flags_class_from_string (klass, NULL, &val, &err);
+  g_assert_error (err, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS);
+  g_assert_false (ok);
+  g_clear_error (&err);
+
+  ok = bolt_flags_class_from_string (klass, "fax-machine", &val, &err);
+  g_assert_error (err, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS);
+  g_assert_false (ok);
+  g_clear_error (&err);
+
+  str = bolt_flags_class_to_string (klass, 0xFFFF, &err);
+  g_assert_error (err, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS);
+  g_assert_null (str);
+  g_clear_error (&err);
+
+  /* there and back again */
+  ref = BOLT_KITT_SSPM | BOLT_KITT_SKI_MODE | BOLT_KITT_TURBO_BOOST;
+  str = bolt_flags_class_to_string (klass, ref, &err);
+  g_assert_no_error (err);
+  g_assert_nonnull (str);
+
+  ok = bolt_flags_class_from_string (klass, str, &val, &err);
+  g_assert_no_error (err);
+  g_assert_true (ok);
+  g_assert_cmpuint (val, ==, ref);
+
+  g_clear_pointer (&str, g_free);
+
+  /* handle "" and 0 */
+  ok = bolt_flags_class_from_string (klass, "", &val, &err);
+  g_assert_no_error (err);
+  g_assert_true (ok);
+  g_assert_cmpuint (val, ==, BOLT_KITT_DISABLED);
+
+  str = bolt_flags_class_to_string (klass, 0, &err);
+  g_assert_no_error (err);
+  g_assert_nonnull (str);
+  g_assert_cmpstr (str, ==, "disabled");
+  g_clear_pointer (&str, g_free);
+
+  /* values as compositions */
+  ok = bolt_flags_class_from_string (klass, "default", &val, &err);
+  g_assert_no_error (err);
+  g_assert_true (ok);
+  g_assert_cmpuint (val, ==, BOLT_KITT_DEFAULT);
+  g_assert_cmpuint (val, ==, BOLT_KITT_ENABLED | BOLT_KITT_SSPM);
+
+  ref = BOLT_KITT_ENABLED | BOLT_KITT_SSPM;
+  str = bolt_flags_class_to_string (klass, ref, &err);
+  g_assert_no_error (err);
+  g_assert_nonnull (str);
+
+  g_assert_true (strstr (str, "enabled"));
+  g_assert_true (strstr (str, "sspm"));
+
+  g_clear_pointer (&str, g_free);
+
+  /* test flags updating */
+  val = 0;
+  chg = bolt_flags_update (0, &val, 0);
+  g_assert_false (chg);
+
+  /* no updates */
+  val = 0;
+  ref = BOLT_KITT_SSPM | BOLT_KITT_SKI_MODE | BOLT_KITT_TURBO_BOOST;
+  chg = bolt_flags_update (ref, &val, 0);
+  g_assert_false (chg);
+
+  val = BOLT_KITT_SSPM | BOLT_KITT_SKI_MODE | BOLT_KITT_TURBO_BOOST;
+  chg = bolt_flags_update (ref, &val, 0);
+  g_assert_false (chg);
+
+  chg = bolt_flags_update (ref, &val, val);
+  g_assert_false (chg);
+
+  /* finally, some updates */
+  val = 0;
+  ref = BOLT_KITT_SSPM | BOLT_KITT_SKI_MODE | BOLT_KITT_TURBO_BOOST;
+
+  chg = bolt_flags_update (ref, &val, BOLT_KITT_SSPM);
+  g_assert_true (chg);
+  g_assert_cmpuint (val, ==, BOLT_KITT_SSPM);
+
+  val = 0;
+  chg = bolt_flags_update (ref, &val, BOLT_KITT_TURBO_BOOST);
+  g_assert_true (chg);
+  g_assert_cmpuint (val, ==, BOLT_KITT_TURBO_BOOST);
+
+  val = BOLT_KITT_SSPM;
+  ref = BOLT_KITT_TURBO_BOOST;
+  chg = bolt_flags_update (ref, &val, BOLT_KITT_TURBO_BOOST);
+  g_assert_true (chg);
+
+  ref = BOLT_KITT_TURBO_BOOST | BOLT_KITT_SSPM;
+  g_assert_cmpuint (val, ==, ref);
+
+  val = BOLT_KITT_TURBO_BOOST | BOLT_KITT_SSPM;
+  ref = 0;
+  chg = bolt_flags_update (ref, &val, BOLT_KITT_TURBO_BOOST);
+  g_assert_cmpuint (val, ==, BOLT_KITT_SSPM);
+  g_assert_true (chg);
+
+  /* simple checks for helper class */
+  ref = BOLT_KITT_TURBO_BOOST | BOLT_KITT_SSPM;
+  g_assert_true (bolt_flag_isset (ref, BOLT_KITT_TURBO_BOOST));
+  g_assert_true (bolt_flag_isset (ref, BOLT_KITT_SSPM));
+  g_assert_false (bolt_flag_isclear (ref,  BOLT_KITT_TURBO_BOOST));
+
+  g_assert_false (bolt_flag_isset (ref, BOLT_KITT_SKI_MODE));
+  g_assert_true (bolt_flag_isclear (ref, BOLT_KITT_SKI_MODE));
 }
 
 typedef void (*rng_t) (void *buf,
@@ -174,42 +438,6 @@ test_rng (TestRng *tt, gconstpointer user_data)
 #endif
 
 }
-
-static void
-test_erase (TestRng *tt, gconstpointer user_data)
-{
-  char buf[256] = {0, };
-  char *d1, *d2, *n0 = NULL;
-  size_t n;
-
-  bolt_get_random_data (buf, sizeof (buf) - 1);
-  d1 = g_strdup (buf);
-  d2 = g_strdup (buf);
-
-  g_assert_nonnull (d2);
-  g_assert_nonnull (d2);
-
-  /* make sure we don't crash on NULL */
-  bolt_str_erase (NULL);
-  bolt_str_erase (n0);
-  bolt_str_erase_clear (&n0);
-
-  bolt_str_erase_clear (&d2);
-  g_assert_null (d2);
-
-  n = strlen (d1);
-  bolt_str_erase (d1);
-  g_assert_cmpstr (d1, !=, buf);
-
-  g_assert_cmpuint (strlen (d1), ==, 0);
-  for (guint i = 0; i < n; i++)
-    g_assert_cmpint (d1[i], ==, 0);
-
-  bolt_erase_n (buf, sizeof (buf));
-  for (guint i = 0; i < n; i++)
-    g_assert_cmpint (buf[i], ==, 0);
-}
-
 
 typedef struct
 {
@@ -395,8 +623,10 @@ test_str (TestRng *tt, gconstpointer user_data)
 static void
 test_str_erase (TestRng *tt, gconstpointer user_data)
 {
+  g_autofree char *d1 = NULL;
+  g_autofree char *d2 = NULL;
+  g_autofree char *n0 = NULL;
   char buf[256] = {0, };
-  char *d1, *d2, *n0 = NULL;
   size_t n;
 
   bolt_get_random_data (buf, sizeof (buf) - 1);
@@ -427,6 +657,84 @@ test_str_erase (TestRng *tt, gconstpointer user_data)
     g_assert_cmpint (buf[i], ==, 0);
 }
 
+static void
+test_str_set (TestRng *tt, gconstpointer user_data)
+{
+  g_autofree char *target = NULL;
+  g_autofree char *str = NULL;
+
+  bolt_set_str (&target, NULL);
+  g_assert_null (target);
+
+  str = g_strdup ("test");
+  bolt_set_str (&target, str);
+
+  g_assert_nonnull (target);
+  g_assert_true (str == target);
+  str = NULL; /* owned by target now */
+
+  bolt_set_strdup (&target, "foobar");
+  g_assert_cmpstr (target, ==, "foobar");
+}
+
+static void
+test_list_nh (TestRng *tt, gconstpointer user_data)
+{
+  BoltList n[10];
+  BoltList *l = n;
+  BoltList *k;
+  BoltList iter;
+  guint c;
+
+  bolt_list_init (l);
+  g_assert_cmpuint (bolt_nhlist_len (NULL), ==, 0);
+  g_assert_cmpuint (bolt_nhlist_len (l), ==, 1);
+
+  g_assert_true (l->next == l);
+  g_assert_true (l->prev == l);
+
+  c = 0;
+  bolt_nhlist_iter_init (&iter, l);
+  while ((k = bolt_nhlist_iter_next (&iter)))
+    {
+      BoltList *p = bolt_nhlist_iter_node (&iter);
+      g_assert_true (k == l);
+      g_assert_true (p == l);
+      c++;
+    }
+  g_assert_cmpuint (c, ==, 1);
+
+  for (gsize i = 1; i < 10; i++)
+    {
+      bolt_list_init (&n[i]);
+      bolt_list_add_before (l, &n[i]);
+      g_assert_cmpuint (bolt_nhlist_len (l), ==, i + 1);
+    }
+
+  for (gsize i = 0; i < 10; i++)
+    {
+      gsize j = (i + 1) % 10;
+      g_assert_true (l[i].next == &l[j]);
+      g_assert_true (l[j].prev == &l[i]);
+
+      g_assert_true (l[i].next->prev == &l[i]);
+      g_assert_true (l[i].prev->next == &l[i]);
+    }
+
+  c = 0;
+  bolt_nhlist_iter_init (&iter, l);
+  while ((k = bolt_nhlist_iter_next (&iter)))
+    {
+      BoltList *p = bolt_nhlist_iter_node (&iter);
+      g_assert_true (k == n + (c % 10));
+      g_assert_true (k == p);
+      c++;
+    }
+
+  g_assert_cmpuint (c, ==, 10);
+}
+
+
 int
 main (int argc, char **argv)
 {
@@ -442,18 +750,18 @@ main (int argc, char **argv)
               test_enums,
               NULL);
 
+  g_test_add ("/common/flags",
+              TestRng,
+              NULL,
+              NULL,
+              test_flags,
+              NULL);
+
   g_test_add ("/common/rng",
               TestRng,
               NULL,
               NULL,
               test_rng,
-              NULL);
-
-  g_test_add ("/common/erase",
-              TestRng,
-              NULL,
-              NULL,
-              test_erase,
               NULL);
 
   g_test_add ("/common/io/verify",
@@ -482,6 +790,20 @@ main (int argc, char **argv)
               NULL,
               NULL,
               test_str_erase,
+              NULL);
+
+  g_test_add ("/common/str/set",
+              TestRng,
+              NULL,
+              NULL,
+              test_str_set,
+              NULL);
+
+  g_test_add ("/common/list/nh",
+              TestRng,
+              NULL,
+              NULL,
+              test_list_nh,
               NULL);
 
   return g_test_run ();

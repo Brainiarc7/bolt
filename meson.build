@@ -1,6 +1,6 @@
 project('bolt',
   'c',
-  version: '0.2',
+  version: '0.5',
   license : 'LGPL-2.1+',
   meson_version: '>= 0.42.0',
   default_options: ['warning_level=1',
@@ -46,7 +46,6 @@ test_args = [
   '-Wsign-compare',
   '-Wstrict-aliasing',
   '-Wstrict-prototypes',
-  '-Wswitch-default',
   '-Wtype-limits',
   '-Wundef',
   '-Wuninitialized',
@@ -71,14 +70,15 @@ req_man = build_man == 'true'
 
 gnome  = import('gnome')
 
-glib    = dependency('glib-2.0')
+glib    = dependency('glib-2.0', version: '>= 2.50.0')
 gio     = dependency('gio-2.0')
 libudev = dependency('libudev')
 unix    = dependency('gio-unix-2.0')
 udev    = dependency('udev')
-umock   = dependency('umockdev-1.0')
 polkit  = dependency('polkit-gobject-1')
 systemd = dependency('systemd')
+libsysd = dependency('libsystemd')
+mockdev = dependency('umockdev-1.0', required: false)
 
 git     = find_program('git', required: false)
 a2x     = find_program(['a2x', 'a2x.py'], required: req_man)
@@ -129,7 +129,7 @@ endif
 
 config_h = configure_file(output: 'config.h', configuration: conf)
 
-cargs = ['-DG_LOG_DOMAIN="Bolt"']
+cargs = ['-DG_LOG_DOMAIN="bolt"']
 
 privileged_group = get_option('privileged-group')
 subs = configuration_data()
@@ -171,7 +171,8 @@ common_sources = [
   'common/bolt-io.c',
   'common/bolt-rnd.c',
   'common/bolt-str.c',
-  'common/bolt-term.c'
+  'common/bolt-term.c',
+  'common/bolt-time.c'
 ]
 
 common_enums = gnome.mkenums_simple('bolt-enum-types',
@@ -185,7 +186,7 @@ common_lib = static_library('common',
   sources: common_sources + gen_sources + gen_headers,
   dependencies: common_deps,
   include_directories: [
-    include_directories('.')
+    include_directories('common')
 ])
 
 common = declare_dependency(
@@ -201,16 +202,23 @@ common = declare_dependency(
 daemon_sources = files([
   'boltd/bolt-auth.c',
   'boltd/bolt-bouncer.c',
+  'boltd/bolt-config.c',
+  'boltd/bolt-domain.c',
+  'boltd/bolt-exported.c',
   'boltd/bolt-manager.c',
+  'boltd/bolt-power.c',
   'boltd/bolt-device.c',
   'boltd/bolt-key.c',
-  'boltd/bolt-store.c'
+  'boltd/bolt-log.c',
+  'boltd/bolt-store.c',
+  'boltd/bolt-sysfs.c'
 ])
 
-daemon_sources += gnome.gdbus_codegen('bolt-gdbus',
-  'data/org.freedesktop.bolt.xml',
-  interface_prefix: 'org.freedesktop.bolt1.',
-  namespace: 'BoltDBus')
+daemon_sources += gnome.compile_resources(
+  'bolt-daemon-resource',
+  'data/boltd.gresource.xml',
+  source_dir: 'data',
+  c_name: 'bolt_daemon')
 
 install_data(['data/org.freedesktop.bolt.xml'],
   install_dir : join_paths(datadir, 'dbus-1', 'interfaces')
@@ -268,6 +276,7 @@ daemon_deps = [
   glib,
   gio,
   libudev,
+  libsysd,
   polkit,
   unix,
   common
@@ -304,6 +313,7 @@ executable('boltd',
 executable('boltctl',
    ['cli/bolt-client.c',
     'cli/bolt-device.c',
+    'cli/bolt-domain.c',
     'cli/bolt-proxy.c',
     'cli/boltctl.c'],
   dependencies: [glib,
@@ -318,29 +328,72 @@ executable('boltctl',
 
 
 # testing
+test_resources = gnome.compile_resources(
+  'bolt-test-resources',
+  'tests/tests.gresource.xml',
+  source_dir: 'tests',
+  c_name: 'bolt_test')
+
+test_enums = gnome.mkenums_simple(
+  'test-enum-types',
+  sources: ['tests/test-enums.h'])
 
 tests = [
-  ['test-common'],
+  ['test-common', [], test_enums],
+  ['test-exported', [libdaemon], [test_resources]],
+  ['test-logging', [libdaemon]],
   ['test-store', [libdaemon]]
 ]
+
+if mockdev.found()
+  tests += [
+    ['test-sysfs',
+     [libdaemon, mockdev],
+     ['tests/mock-sysfs.c']]
+  ]
+endif
 
 foreach t: tests
   test_name = t.get(0)
   test_deps = [common] + t.get(1, [])
   test_srcs = ['tests/@0@.c'.format(test_name), t.get(2, [])]
-  e = executable(test_name, test_srcs, dependencies: test_deps)
+  test_exec = executable(
+    test_name,
+    test_srcs,
+    dependencies: test_deps,
+    include_directories: [
+      include_directories('tests')
+    ])
 
   test_env = environment()
-  test_env.prepend('LD_PRELOAD', 'libumockdev-preload.so.0')
-  test(test_name, e, env: test_env, timeout : 120)
 
+  if test_deps.contains(mockdev)
+    test_env.prepend('LD_PRELOAD', 'libumockdev-preload.so.0')
+  endif
+
+  test(test_name, test_exec, env: test_env, timeout: 120)
 endforeach
 
 test_it = find_program(join_paths(srcdir, 'tests', 'test-integration'))
-test_env = environment()
-test_env.prepend('LD_PRELOAD', 'libumockdev-preload.so.0')
-test_env.prepend('BOLT_BUILD_DIR', meson.current_build_dir())
-test('test-integration', test_it, env: test_env, timeout: 120)
+res = run_command(test_it, 'list-tests')
+if res.returncode() == 0
+  test_env = environment()
+  test_env.prepend('LD_PRELOAD', 'libumockdev-preload.so.0')
+  test_env.prepend('BOLT_BUILD_DIR', meson.current_build_dir())
+
+  tests = res.stdout().strip().split(' ')
+  foreach t: tests
+    name = 'integration @0@'.format(t.split('.')[1])
+    test(name, test_it, args: [t], env: test_env, timeout: 120)
+  endforeach
+else
+  msg = '@0@'.format(res.stderr().strip())
+  if meson.version().version_compare('<0.44.0')
+    message(msg)
+  else
+    warning(msg)
+  endif
+endif
 
 # contrib
 
@@ -352,29 +405,44 @@ spec_file = configure_file(
 
 # documentation
 
-build_man = build_man != false and a2x.found()
+build_man = build_man != 'false' and a2x.found()
 if build_man
 
-  man = custom_target(
-    'boltctl-man',
-    build_by_default: true,
-    input: 'docs/boltctl.1.txt',
-    output: 'boltctl.1',
-    command: [
-      a2x,
-      '-d', 'manpage',
-      '-f', 'manpage',
-      '-D', '@OUTDIR@',
-      '-a', 'manmanual=bolt Manual',
-      '-a', 'mansource=bolt',
-      '-a', 'revnumber=@0@'.format(meson.project_version()),
-      '@INPUT@'
-    ],
-    install: true,
-    install_dir: join_paths(mandir, 'man1'),
-  )
+  foreach page : [
+    ['boltctl', '1'],
+    ['boltd',   '8']
+  ]
+
+    name = page[0]
+    section = page[1]
+
+    custom_target(
+      '@0@-man'.format(page[0]),
+      build_by_default: true,
+      input: 'docs/@0@.@1@.txt'.format(name, section),
+      output: '@0@.@1@'.format(name, section),
+      command: [
+        a2x,
+        '-d', 'manpage',
+        '-f', 'manpage',
+        '-D', '@OUTDIR@',
+        '-a', 'manmanual=bolt Manual',
+        '-a', 'mansource=bolt',
+        '-a', 'revnumber=@0@'.format(meson.project_version()),
+        '@INPUT@'
+      ],
+      install: true,
+      install_dir: join_paths(mandir, 'man@0@'.format(section)),
+    )
+  endforeach
 
 endif
+
+meson.add_install_script('scripts/meson-install.sh', dbdir)
+
+run_target('uncrustify',
+           command: 'scripts/uncrustify.sh')
+
 
 # all done, phew
 

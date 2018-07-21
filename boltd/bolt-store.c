@@ -25,7 +25,9 @@
 #include "bolt-error.h"
 #include "bolt-fs.h"
 #include "bolt-io.h"
+#include "bolt-log.h"
 #include "bolt-str.h"
+#include "bolt-time.h"
 
 #include <string.h>
 
@@ -185,6 +187,7 @@ bolt_store_class_init (BoltStoreClass *klass)
 #define DEVICE_GROUP "device"
 #define USER_GROUP "user"
 
+#define CFG_FILE "boltd.conf"
 
 /* public methods */
 
@@ -200,6 +203,62 @@ bolt_store_new (const char *path)
                         NULL);
 
   return store;
+}
+
+GKeyFile *
+bolt_store_config_load (BoltStore *store,
+                        GError   **error)
+{
+  g_autoptr(GKeyFile) kf = NULL;
+  g_autoptr(GFile) sf = NULL;
+  g_autofree char *data  = NULL;
+  gboolean ok;
+  gsize len;
+
+  g_return_val_if_fail (store != NULL, FALSE);
+
+  sf = g_file_get_child (store->root, CFG_FILE);
+  ok = g_file_load_contents (sf, NULL,
+                             &data, &len,
+                             NULL,
+                             error);
+
+  if (!ok)
+    return NULL;
+
+  kf = g_key_file_new ();
+  ok = g_key_file_load_from_data (kf, data, len, G_KEY_FILE_NONE, error);
+
+  if (!ok)
+    return NULL;
+
+  return g_steal_pointer (&kf);
+}
+
+gboolean
+bolt_store_config_save (BoltStore *store,
+                        GKeyFile  *config,
+                        GError   **error)
+{
+  g_autoptr(GFile) sf = NULL;
+  g_autofree char *data  = NULL;
+  gboolean ok;
+  gsize len;
+
+  sf = g_file_get_child (store->root, CFG_FILE);
+  data = g_key_file_to_data (config, &len, error);
+
+  if (!data)
+    return FALSE;
+
+  ok = g_file_replace_contents (sf,
+                                data, len,
+                                NULL, FALSE,
+                                0,
+                                NULL,
+                                NULL, error);
+
+  return ok;
 }
 
 GStrv
@@ -246,8 +305,11 @@ bolt_store_put_device (BoltStore  *store,
   g_autoptr(GFile) entry = NULL;
   g_autoptr(GKeyFile) kf = NULL;
   g_autofree char *data  = NULL;
+  BoltDeviceType type;
   const char *uid;
+  const char *label;
   gboolean ok;
+  gint64 stime;
   gsize len;
   guint keystate = 0;
 
@@ -268,11 +330,26 @@ bolt_store_put_device (BoltStore  *store,
   g_key_file_set_string (kf, DEVICE_GROUP, "name", bolt_device_get_name (device));
   g_key_file_set_string (kf, DEVICE_GROUP, "vendor", bolt_device_get_vendor (device));
 
-  if (policy != BOLT_POLICY_INVALID)
+  type = bolt_device_get_device_type (device);
+  g_key_file_set_string (kf, DEVICE_GROUP, "type", bolt_device_type_to_string (type));
+
+  if (policy != BOLT_POLICY_DEFAULT)
     {
       const char *str = bolt_policy_to_string (policy);
       g_key_file_set_string (kf, USER_GROUP, "policy", str);
     }
+
+  label = bolt_device_get_label (device);
+
+  if (label != NULL)
+    g_key_file_set_string (kf, USER_GROUP, "label", label);
+
+  stime = bolt_device_get_storetime (device);
+
+  if (stime < 1)
+    stime = (gint64) bolt_now_in_seconds ();
+
+  g_key_file_set_uint64 (kf, USER_GROUP, "storetime", stime);
 
   data = g_key_file_to_data (kf, &len, error);
 
@@ -289,7 +366,7 @@ bolt_store_put_device (BoltStore  *store,
         ok = bolt_key_save_file (key, keypath, &err);
 
       if (!ok)
-        g_warning ("failed to store key: %s", err->message);
+        bolt_warn_err (err, "failed to store key");
       else
         keystate = bolt_key_get_state (key);
     }
@@ -307,6 +384,7 @@ bolt_store_put_device (BoltStore  *store,
                     "store", store,
                     "policy", policy,
                     "key", keystate,
+                    "storetime", stime,
                     NULL);
 
       g_signal_emit (store, signals[SIGNAL_DEVICE_ADDED], 0, uid);
@@ -320,13 +398,18 @@ bolt_store_get_device (BoltStore *store, const char *uid, GError **error)
 {
   g_autoptr(GKeyFile) kf = NULL;
   g_autoptr(GFile) db = NULL;
+  g_autoptr(GError) err = NULL;
   g_autofree char *name = NULL;
   g_autofree char *vendor = NULL;
   g_autofree char *data  = NULL;
+  g_autofree char *typestr = NULL;
   g_autofree char *polstr = NULL;
+  g_autofree char *label = NULL;
+  BoltDeviceType type;
   BoltPolicy policy;
   BoltKeyState key;
   gboolean ok;
+  guint64 stime;
   gsize len;
 
   g_return_val_if_fail (store != NULL, FALSE);
@@ -349,28 +432,74 @@ bolt_store_get_device (BoltStore *store, const char *uid, GError **error)
 
   name = g_key_file_get_string (kf, DEVICE_GROUP, "name", NULL);
   vendor = g_key_file_get_string (kf, DEVICE_GROUP, "vendor", NULL);
+  typestr = g_key_file_get_string (kf, DEVICE_GROUP, "type", NULL);
   polstr = g_key_file_get_string (kf, USER_GROUP, "policy", NULL);
-  policy = bolt_policy_from_string (polstr);
+  label = g_key_file_get_string (kf, USER_GROUP, "label", NULL);
 
-  if (!bolt_policy_validate (policy))
+  type = bolt_enum_from_string (BOLT_TYPE_DEVICE_TYPE, typestr, &err);
+  if (type == BOLT_DEVICE_UNKNOWN_TYPE)
     {
-      g_warning ("[%s] invalid policy in store: %s", uid, polstr);
+      bolt_warn_err (err, LOG_TOPIC ("store"), LOG_DEV_UID (uid),
+                     "invalid device type");
+      g_clear_error (&err);
+      type = BOLT_DEVICE_PERIPHERAL;
+    }
+
+  policy = bolt_enum_from_string (BOLT_TYPE_POLICY, polstr, &err);
+  if (policy == BOLT_POLICY_UNKNOWN)
+    {
+      bolt_warn_err (err, LOG_TOPIC ("store"), LOG_DEV_UID (uid),
+                     "invalid policy");
+      g_clear_error (&err);
       policy = BOLT_POLICY_MANUAL;
     }
 
+  if (label != NULL)
+    {
+      g_autofree char *tmp = g_steal_pointer (&label);
+      label = bolt_strdup_validate (tmp);
+      if (label == NULL)
+        bolt_warn (LOG_TOPIC ("store"), LOG_DEV_UID (uid),
+                   "invalid device label: %s", label);
+    }
+
+  stime = g_key_file_get_uint64 (kf, USER_GROUP, "storetime", &err);
+  if (err != NULL && !bolt_err_notfound (err))
+    bolt_warn_err (err, LOG_TOPIC ("store"), "invalid enroll-time");
+
+  if (stime == 0)
+    {
+      g_autoptr(GFileInfo) info = NULL;
+
+      info = g_file_query_info (db,
+                                "time::changed",
+                                G_FILE_QUERY_INFO_NONE,
+                                NULL, NULL);
+      if (info != NULL)
+        stime = g_file_info_get_attribute_uint64 (info, "time::changed");
+    }
+
+
   key = bolt_store_have_key (store, uid);
 
-  g_return_val_if_fail (name != NULL, NULL);
-  g_return_val_if_fail (vendor != NULL, NULL);
+  if (name == NULL || vendor == NULL)
+    {
+      g_set_error_literal (error, BOLT_ERROR, BOLT_ERROR_FAILED,
+                           "invalid device entry in store");
+      return NULL;
+    }
 
   return g_object_new (BOLT_TYPE_DEVICE,
                        "uid", uid,
                        "name", name,
                        "vendor", vendor,
+                       "type", type,
                        "status", BOLT_STATUS_DISCONNECTED,
                        "store", store,
                        "policy", policy,
                        "key", key,
+                       "storetime", stime,
+                       "label", label,
                        NULL);
 }
 
@@ -406,7 +535,7 @@ bolt_store_have_key (BoltStore  *store,
   if (keyinfo != NULL)
     key = BOLT_KEY_HAVE; /* todo: check size */
   else if (!bolt_err_notfound (err))
-    g_warning ("error querying key info for %s: %s", uid, err->message);
+    bolt_warn_err (err, LOG_DEV_UID (uid), "error querying key info");
 
   return key;
 }

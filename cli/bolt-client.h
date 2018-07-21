@@ -22,6 +22,7 @@
 
 #include "bolt-enums.h"
 #include "bolt-device.h"
+#include "bolt-domain.h"
 #include "bolt-proxy.h"
 
 G_BEGIN_DECLS
@@ -30,17 +31,82 @@ G_BEGIN_DECLS
 G_DECLARE_FINAL_TYPE (BoltClient, bolt_client, BOLT, CLIENT, BoltProxy);
 
 BoltClient *    bolt_client_new (GError **error);
-GPtrArray *     bolt_client_list_devices (BoltClient *client,
-                                          GError    **error);
-BoltDevice *    bolt_client_get_device (BoltClient *client,
-                                        const char *uid,
-                                        GError    **error);
-BoltDevice *    bolt_client_enroll_device (BoltClient   *client,
-                                           const char   *uid,
-                                           BoltPolicy    policy,
-                                           BoltAuthFlags flags,
-                                           GError      **error);
+
+void            bolt_client_new_async (GCancellable       *cancellable,
+                                       GAsyncReadyCallback callback,
+                                       gpointer            user_data);
+BoltClient *    bolt_client_new_finish (GAsyncResult *res,
+                                        GError      **error);
+
+GPtrArray *     bolt_client_list_domains (BoltClient   *client,
+                                          GCancellable *cancellable,
+                                          GError      **error);
+
+GPtrArray *     bolt_client_list_devices (BoltClient   *client,
+                                          GCancellable *cancellable,
+                                          GError      **error);
+
+BoltDevice *    bolt_client_get_device (BoltClient   *client,
+                                        const char   *uid,
+                                        GCancellable *cancellable,
+                                        GError      **error);
+
+BoltDevice *    bolt_client_enroll_device (BoltClient  *client,
+                                           const char  *uid,
+                                           BoltPolicy   policy,
+                                           BoltAuthCtrl flags,
+                                           GError     **error);
+
+void            bolt_client_enroll_device_async (BoltClient         *client,
+                                                 const char         *uid,
+                                                 BoltPolicy          policy,
+                                                 BoltAuthCtrl        flags,
+                                                 GCancellable       *cancellable,
+                                                 GAsyncReadyCallback callback,
+                                                 gpointer            user_data);
+
+gboolean        bolt_client_enroll_device_finish (BoltClient   *client,
+                                                  GAsyncResult *res,
+                                                  char        **path,
+                                                  GError      **error);
+
 gboolean        bolt_client_forget_device (BoltClient *client,
                                            const char *uid,
                                            GError    **error);
+
+void            bolt_client_forget_device_async (BoltClient         *client,
+                                                 const char         *uid,
+                                                 GCancellable       *cancellable,
+                                                 GAsyncReadyCallback callback,
+                                                 gpointer            user_data);
+
+gboolean        bolt_client_forget_device_finish (BoltClient   *client,
+                                                  GAsyncResult *res,
+                                                  GError      **error);
+
+/* getter */
+guint           bolt_client_get_version (BoltClient *client);
+
+gboolean        bolt_client_is_probing (BoltClient *client);
+
+BoltSecurity    bolt_client_get_security (BoltClient *client);
+
+BoltAuthMode    bolt_client_get_authmode (BoltClient *client);
+
+/* setter */
+
+void            bolt_client_set_authmode_async (BoltClient         *client,
+                                                BoltAuthMode        mode,
+                                                GCancellable       *cancellable,
+                                                GAsyncReadyCallback callback,
+                                                gpointer            user_data);
+
+gboolean        bolt_client_set_authmode_finish (BoltClient   *client,
+                                                 GAsyncResult *res,
+                                                 GError      **error);
+
+/* utility functions */
+void            bolt_devices_sort_by_syspath (GPtrArray *devices,
+                                              gboolean   reverse);
+
 G_END_DECLS

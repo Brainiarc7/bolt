@@ -28,7 +28,58 @@
       </doc:para></doc:description></doc:doc>
     </property>
 
+    <property name="DefaultPolicy" type="s" access="read">
+      <doc:doc><doc:description><doc:para>
+	The policy to use during enrollment when "default" was
+	sepcified.
+      </doc:para></doc:description></doc:doc>
+    </property>
+
+    <property name="SecurityLevel" type="s" access="read">
+      <doc:doc><doc:description><doc:para>
+        The security level of the system.
+      </doc:para></doc:description></doc:doc>
+    </property>
+
+    <property name="AuthMode" type="s" access="readwrite">
+      <doc:doc><doc:description><doc:para>
+	The authorization mode of the daemon. Currently supported
+	values are "enabled" if it is authorizing devices or
+	"disabled" if authorization is disabled.
+      </doc:para></doc:description></doc:doc>
+    </property>
+
     <!-- methods -->
+
+    <method name="ListDomains">
+      <arg name="domains" direction="out" type="ao">
+        <doc:doc><doc:summary>An array of object paths for the domains.</doc:summary></doc:doc>
+      </arg>
+
+      <doc:doc>
+        <doc:description>
+          <doc:para>
+            List all active thunderbolt domains.
+	  </doc:para>
+        </doc:description>
+      </doc:doc>
+    </method>
+
+    <method name="DomainById">
+      <arg type='s' name='id' direction='in'>
+	<doc:doc><doc:summary>The id of the domain. </doc:summary></doc:doc>
+      </arg>
+      <arg name="domain" direction="out" type="o">
+	<doc:doc><doc:summary>Object path for the domain.</doc:summary></doc:doc>
+      </arg>
+      <doc:doc>
+	<doc:description>
+	  <doc:para>
+	    Return a domain given its identifier.
+	  </doc:para>
+        </doc:description>
+      </doc:doc>
+    </method>
 
     <method name="ListDevices">
       <arg name="devices" direction="out" type="ao">
@@ -67,11 +118,11 @@
         <doc:doc><doc:summary>The unique id of the device.</doc:summary>
         </doc:doc>
       </arg>
-      <arg type='u' name='policy' direction='in'>
+      <arg type='s' name='policy' direction='in'>
         <doc:doc><doc:summary>Policy to use for the device.</doc:summary>
         </doc:doc>
       </arg>
-      <arg type='u' name='flags' direction='in'>
+      <arg type='s' name='flags' direction='in'>
         <doc:doc><doc:summary>Control aspects of enrollment.</doc:summary>
         </doc:doc>
       </arg>
@@ -129,6 +180,25 @@
       </doc:para></doc:description></doc:doc>
     </signal>
 
+    <signal name="DomainAdded">
+      <arg name="domain" type="o">
+        <doc:doc><doc:summary>Object path of the domain.</doc:summary></doc:doc>
+      </arg>
+
+      <doc:doc><doc:description><doc:para>
+        A thunderbolt domain was added.
+      </doc:para></doc:description></doc:doc>
+    </signal>
+
+    <signal name="DomainRemoved">
+      <arg name="domain" type="o">
+        <doc:doc><doc:summary>Object path of the removed domain.</doc:summary></doc:doc>
+      </arg>
+
+      <doc:doc><doc:description><doc:para>
+        A thunderbolt domain was removed.
+      </doc:para></doc:description></doc:doc>
+    </signal>
 
   </interface>
 
@@ -160,9 +230,28 @@
       </doc:para></doc:description></doc:doc>
     </property>
 
-    <property name="Status" type="u" access="read">
+    <property name="Type" type="s" access="read">
+      <doc:doc><doc:description><doc:para>
+        The type of the device, i.e. 'host' or 'peripheral'
+      </doc:para></doc:description></doc:doc>
+    </property>
+
+    <property name="Status" type="s" access="read">
       <doc:doc><doc:description><doc:para>
         The current status of the device.
+      </doc:para></doc:description></doc:doc>
+    </property>
+
+    <property name="AuthFlags" type="s" access="read">
+      <doc:doc><doc:description><doc:para>
+        Details of authorization information, including
+	if they device was securily authorized via key
+	verification ('secure') or does not support
+	this method ('nokey'). The flag 'boot' indicates
+	that the devices was already authorized by
+	the firmware during pre-boot.
+	If no downstream PCIe tunnels are authorized
+	the 'nopcie' flag will be set.
       </doc:para></doc:description></doc:doc>
     </property>
 
@@ -180,10 +269,11 @@
       </doc:para></doc:description></doc:doc>
     </property>
 
-    <property name="Security" type="u" access="read">
+    <property name="Domain" type="s" access="read">
       <doc:doc><doc:description><doc:para>
-        The security level of the domain the device is
-        connected to.
+        When a device is connected, it always is connected
+	via a thunderbolt domain, directly or via a chain of
+	other devices. This is the indentifier of the domain.
       </doc:para></doc:description></doc:doc>
     </property>
 
@@ -193,15 +283,43 @@
       </doc:para></doc:description></doc:doc>
     </property>
 
-    <property name="Policy" type="u" access="read">
+    <property name="Policy" type="s" access="read">
       <doc:doc><doc:description><doc:para>
         The authorization policy of the device.
       </doc:para></doc:description></doc:doc>
     </property>
 
-    <property name="Key" type="u" access="read">
+    <property name="Key" type="s" access="read">
       <doc:doc><doc:description><doc:para>
         If a key is associated with the device.
+      </doc:para></doc:description></doc:doc>
+    </property>
+
+    <property name="Label" type="s" access="readwrite">
+      <doc:doc><doc:description><doc:para>
+        If set, a name that was given to the device by
+	the user. Can only be set when device is stored.
+      </doc:para></doc:description></doc:doc>
+    </property>
+
+    <property name="ConnectTime" type="t" access="read">
+      <doc:doc><doc:description><doc:para>
+        Point in time (since Epoch, in seconds) when the
+	device was connected (0 if it is not connected).
+      </doc:para></doc:description></doc:doc>
+    </property>
+
+    <property name="AuthorizeTime" type="t" access="read">
+      <doc:doc><doc:description><doc:para>
+        Point in time (since Epoch, in seconds) when the
+	device was authorized (0 if it is not authorized).
+      </doc:para></doc:description></doc:doc>
+    </property>
+
+    <property name="StoreTime" type="t" access="read">
+      <doc:doc><doc:description><doc:para>
+        Point in time (since Epoch, in seconds) when the
+	device was stored (0 if it is not stored).
       </doc:para></doc:description></doc:doc>
     </property>
 
@@ -209,7 +327,7 @@
 
     <method name="Authorize">
 
-     <arg type='u' name='flags' direction='in'>
+     <arg type='s' name='flags' direction='in'>
         <doc:doc><doc:summary>Control aspects of authorization.</doc:summary>
         </doc:doc>
      </arg>
@@ -222,6 +340,36 @@
         </doc:description>
       </doc:doc>
     </method>
+
+  </interface>
+
+  <interface name="org.freedesktop.bolt1.Domain">
+
+    <doc:doc>
+      <doc:description>
+        <doc:para>
+          Representation of a Thunderbolt domain.
+        </doc:para>
+      </doc:description>
+    </doc:doc>
+
+    <property name="Id" type="s" access="read">
+      <doc:doc><doc:description><doc:para>
+        The id of the domain.
+      </doc:para></doc:description></doc:doc>
+    </property>
+
+    <property name="SysfsPath" type="s" access="read">
+      <doc:doc><doc:description><doc:para>
+        The sysfs path of the domain, if it is connected.
+      </doc:para></doc:description></doc:doc>
+    </property>
+
+    <property name="SecurityLevel" type="s" access="read">
+      <doc:doc><doc:description><doc:para>
+        The security level of the domain.
+      </doc:para></doc:description></doc:doc>
+    </property>
 
   </interface>
 

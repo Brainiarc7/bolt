@@ -17,3 +17,5 @@ ProtectSystem=full
 RestrictAddressFamilies=AF_NETLINK AF_UNIX
 RestrictRealtime=yes
 ReadWritePaths=@dbdir@
+SystemCallFilter=~@mount
+CapabilityBoundingSet=CAP_NET_ADMIN

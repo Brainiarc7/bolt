@@ -20,8 +20,22 @@
 
 #pragma once
 
-#define BOLT_DBUS_NAME "org.freedesktop.bolt"
-#define BOLT_DBUS_PATH "/org/freedesktop/bolt"
-#define BOLT_DBUS_INTERFACE "org.freedesktop.bolt1.Manager"
+#include <gio/gio.h>
 
-#define BOLT_DBUS_DEVICE_INTERFACE "org.freedesktop.bolt1.Device"
+G_BEGIN_DECLS
+
+/* forward declaration */
+struct udev;
+
+#define BOLT_TYPE_POWER bolt_power_get_type ()
+G_DECLARE_FINAL_TYPE (BoltPower, bolt_power, BOLT, POWER, GObject);
+
+BoltPower  *        bolt_power_new (struct udev *udev);
+
+gboolean            bolt_power_can_force (BoltPower *power);
+
+gboolean            bolt_power_force_switch (BoltPower *power,
+                                             gboolean   on,
+                                             GError   **error);
+
+G_END_DECLS

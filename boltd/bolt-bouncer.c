@@ -22,7 +22,10 @@
 
 #include "bolt-bouncer.h"
 
+#include "bolt-log.h"
 #include "bolt-str.h"
+
+#include "bolt-exported.h"
 
 #include <gio/gio.h>
 #include <polkit/polkit.h>
@@ -33,11 +36,6 @@ static void     bouncer_initable_iface_init (GInitableIface *iface);
 static gboolean bouncer_initialize (GInitable    *initable,
                                     GCancellable *cancellable,
                                     GError      **error);
-
-static gboolean handle_authorize_method (GDBusInterfaceSkeleton *interface,
-                                         GDBusMethodInvocation  *invocation,
-                                         gpointer                user_data);
-
 
 #ifndef HAVE_POLKIT_AUTOPTR
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (PolkitAuthorizationResult, g_object_unref)
@@ -100,10 +98,43 @@ bouncer_initialize (GInitable    *initable,
 }
 
 /* internal methods */
+
 static gboolean
-handle_authorize_method (GDBusInterfaceSkeleton *iface,
-                         GDBusMethodInvocation  *inv,
-                         gpointer                user_data)
+bolt_bouncer_check_action (BoltBouncer           *bnc,
+                           GDBusMethodInvocation *inv,
+                           const char            *action,
+                           gboolean              *authorized,
+                           GError               **error)
+{
+  g_autoptr(PolkitSubject) subject = NULL;
+  g_autoptr(PolkitDetails) details = NULL;
+  g_autoptr(PolkitAuthorizationResult) res = NULL;
+  PolkitCheckAuthorizationFlags flags;
+  const char *sender;
+
+  sender = g_dbus_method_invocation_get_sender (inv);
+
+  subject = polkit_system_bus_name_new (sender);
+  details = polkit_details_new ();
+
+  flags = POLKIT_CHECK_AUTHORIZATION_FLAGS_ALLOW_USER_INTERACTION;
+  res = polkit_authority_check_authorization_sync (bnc->authority,
+                                                   subject,
+                                                   action, details,
+                                                   flags,
+                                                   NULL, error);
+  if (res == NULL)
+    return FALSE;
+
+  *authorized = polkit_authorization_result_get_is_authorized (res);
+  return TRUE;
+}
+
+static gboolean
+handle_authorize_method (BoltExported          *exported,
+                         GDBusMethodInvocation *inv,
+                         GError               **error,
+                         gpointer               user_data)
 {
   g_autoptr(PolkitSubject) subject = NULL;
   g_autoptr(PolkitDetails) details = NULL;
@@ -128,6 +159,10 @@ handle_authorize_method (GDBusInterfaceSkeleton *iface,
     action = "org.freedesktop.bolt.authorize";
   else if (bolt_streq (method_name, "ForgetDevice"))
     action = "org.freedesktop.bolt.manage";
+  else if (bolt_streq (method_name, "ListDomains"))
+    authorized = TRUE;
+  else if (bolt_streq (method_name, "DomainById"))
+    authorized = TRUE;
   else if (bolt_streq (method_name, "ListDevices"))
     authorized = TRUE;
   else if (bolt_streq (method_name, "DeviceByUid"))
@@ -137,29 +172,70 @@ handle_authorize_method (GDBusInterfaceSkeleton *iface,
     {
       PolkitCheckAuthorizationFlags flags;
       g_autoptr(PolkitAuthorizationResult) res = NULL;
-      g_autoptr(GError) error = NULL;
 
       flags = POLKIT_CHECK_AUTHORIZATION_FLAGS_ALLOW_USER_INTERACTION;
       res = polkit_authority_check_authorization_sync (bnc->authority,
                                                        subject,
                                                        action, details,
                                                        flags,
-                                                       NULL, &error);
+                                                       NULL, error);
       if (res == NULL)
-        {
-          g_dbus_method_invocation_return_error (inv, G_DBUS_ERROR, G_DBUS_ERROR_FAILED,
-                                                 "Authorization error: %s",
-                                                 error->message);
-          return FALSE;
-        }
+        return FALSE;
 
       authorized = polkit_authorization_result_get_is_authorized (res);
     }
 
   if (authorized == FALSE)
-    g_dbus_method_invocation_return_error (inv, G_DBUS_ERROR, G_DBUS_ERROR_ACCESS_DENIED,
-                                           "Bolt operation '%s' not allowed for user",
-                                           method_name);
+    g_set_error (error, G_DBUS_ERROR, G_DBUS_ERROR_ACCESS_DENIED,
+                 "Bolt operation '%s' not allowed for user",
+                 method_name);
+
+  return authorized;
+}
+
+static gboolean
+handle_authorize_property (BoltExported          *exported,
+                           const char            *name,
+                           gboolean               setting,
+                           GDBusMethodInvocation *inv,
+                           GError               **error,
+                           gpointer               user_data)
+{
+  const char *type_name = G_OBJECT_TYPE_NAME (exported);
+  const char *action = NULL;
+  gboolean authorized = FALSE;
+  BoltBouncer *bnc;
+
+  bnc = BOLT_BOUNCER (user_data);
+
+  if (bolt_streq (type_name, "BoltDevice"))
+    {
+      if (bolt_streq (name, "label"))
+        action = "org.freedesktop.bolt.manage";
+    }
+  else if (bolt_streq (type_name, "BoltManager"))
+    {
+      if (bolt_streq (name, "auth-mode"))
+        action = "org.freedesktop.bolt.manage";
+    }
+
+  if (!authorized && action)
+    {
+      gboolean ok;
+      ok = bolt_bouncer_check_action (bnc,
+                                      inv,
+                                      action,
+                                      &authorized,
+                                      error);
+      if (!ok)
+        return FALSE;
+    }
+
+
+  if (authorized == FALSE)
+    g_set_error (error, G_DBUS_ERROR, G_DBUS_ERROR_ACCESS_DENIED,
+                 "Setting property of '%s.%s' not allowed for user",
+                 type_name, name);
 
   return authorized;
 }
@@ -178,9 +254,17 @@ void
 bolt_bouncer_add_client (BoltBouncer *bnc,
                          gpointer     client)
 {
-  g_return_if_fail (G_IS_DBUS_INTERFACE_SKELETON (client));
-
-  g_signal_connect (client, "g-authorize-method",
-                    G_CALLBACK (handle_authorize_method),
-                    bnc);
+  if (BOLT_IS_EXPORTED (client))
+    {
+      g_signal_connect_object (client, "authorize-method",
+                               G_CALLBACK (handle_authorize_method),
+                               bnc, 0);
+      g_signal_connect_object (client, "authorize-property",
+                               G_CALLBACK (handle_authorize_property),
+                               bnc, 0);
+    }
+  else
+    {
+      bolt_critical (LOG_TOPIC ("bouncer"), "unknown client class");
+    }
 }

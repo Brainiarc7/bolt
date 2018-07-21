@@ -28,6 +28,11 @@ G_BEGIN_DECLS
  * BoltError:
  * @BOLT_ERROR_FAILED: Generic error code
  * @BOLT_ERROR_UDEV: UDev error
+ * @BOLT_ERROR_NOKEY: Key for authorization is missing
+ * @BOLT_ERROR_BADKEY: The key is invalid
+ * @BOLT_ERROR_CFG: Configuration is invalid
+ * @BOLT_ERROR_BADSTATE: Device is in the wrong state
+ * @BOLT_ERROR_AUTHCHAIN: Interrupted authorization chain
  *
  * Error codes used inside Bolt.
  */
@@ -36,6 +41,9 @@ enum {
   BOLT_ERROR_UDEV,
   BOLT_ERROR_NOKEY,
   BOLT_ERROR_BADKEY,
+  BOLT_ERROR_CFG,
+  BOLT_ERROR_BADSTATE,
+  BOLT_ERROR_AUTHCHAIN,
 } BoltError;
 
 
@@ -45,5 +53,10 @@ GQuark bolt_error_quark (void);
 /* helper function to check for certain error types */
 gboolean bolt_err_notfound (const GError *error);
 gboolean bolt_err_exists (const GError *error);
+gboolean bolt_err_inval (const GError *error);
+gboolean bolt_err_cancelled (const GError *error);
+
+gboolean bolt_error_propagate_stripped (GError **dest,
+                                        GError **source);
 
 G_END_DECLS

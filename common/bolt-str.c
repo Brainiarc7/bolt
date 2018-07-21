@@ -22,6 +22,7 @@
 
 #include "bolt-str.h"
 
+#include <errno.h>
 #include <string.h>
 
 typedef void (* zero_fn_t) (void  *s,
@@ -73,4 +74,84 @@ bolt_strv_from_ptr_array (GPtrArray **array)
 
   *array = NULL;
   return (GStrv) g_ptr_array_free (a, FALSE);
+}
+
+char *
+bolt_strdup_validate (const char *string)
+{
+  g_autofree char *str = NULL;
+  gboolean ok;
+  gsize l;
+
+  if (string == NULL)
+    return NULL;
+
+  str = g_strdup (string);
+  str = g_strstrip (str);
+
+  l = strlen (str);
+  if (l == 0)
+    return NULL;
+
+  ok = g_utf8_validate (str, l, NULL);
+
+  if (!ok)
+    return NULL;
+
+  return g_steal_pointer (&str);
+}
+
+char *
+bolt_strstrip (char *string)
+{
+  char *str;
+
+  if (string == NULL)
+    return NULL;
+
+  str = g_strstrip (string);
+
+  if (strlen (str) == 0)
+    g_clear_pointer (&str, g_free);
+
+  return str;
+}
+
+gboolean
+bolt_str_parse_as_int (const char *str,
+                       gint       *ret)
+{
+  char *end;
+  gint64 val;
+
+  g_return_val_if_fail (str != NULL, -1);
+
+  errno = 0;
+  val = g_ascii_strtoll (str, &end, 0);
+
+  /* conversion errors */
+  if (val == 0 && errno != 0)
+    return FALSE;
+
+  /* check over/underflow */
+  if ((val == G_MAXINT64 || val == G_MININT64) &&
+      errno == ERANGE)
+    return FALSE;
+
+  if (str == end)
+    {
+      errno = -EINVAL;
+      return FALSE;
+    }
+
+  if (val > G_MAXINT || val < G_MININT)
+    {
+      errno = -ERANGE;
+      return FALSE;
+    }
+
+  if (ret)
+    *ret = (gint) val;
+
+  return TRUE;
 }
